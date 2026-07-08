@@ -1,0 +1,34 @@
+# Data (lives on IBEX, never in git)
+data/
+*.bam
+*.bam.bai
+*.h5
+*.h5ad
+*.h5mu
+*.mtx
+*.mtx.gz
+*.tsv.gz
+*.parquet
+*.tiff
+*.tif
+*.cloupe
+*.geojson
+
+# Jupyter
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# SLURM logs
+log.*.out
+err.*.err
+
+# OS / editor junk
+.DS_Store
+*.swp
+*.ipynb
