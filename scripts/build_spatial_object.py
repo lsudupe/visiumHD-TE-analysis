@@ -73,16 +73,25 @@ def load_gene_adata_8um(sample: str) -> ad.AnnData:
 
 
 def find_solote_matrix_dir(sample: str, level: str) -> Path:
-    suffix = LEVEL_SUFFIX[level]
+    """Locate the SoloTE matrix folder for the exact requested level.
+    NOTE: a naive glob like '*familytes_MATRIX' also matches
+    'subfamilytes_MATRIX' (since it ends with the same substring), which
+    silently picked the wrong matrix for some samples. We match the exact
+    level word via regex instead."""
     sample_dir = SOLOTE_DIR / f"{sample}_SoloTE_output"
     if not sample_dir.exists():
         candidates = list(SOLOTE_DIR.glob(f"{sample}*_SoloTE_output"))
         if not candidates:
             raise FileNotFoundError(f"No SoloTE output folder found for sample '{sample}'")
         sample_dir = candidates[0]
-    matches = list(sample_dir.glob(f"*{suffix}"))
+
+    pattern = re.compile(rf"_{re.escape(level)}tes_MATRIX$")
+    matches = [d for d in sample_dir.iterdir() if d.is_dir() and pattern.search(d.name)]
     if not matches:
-        raise FileNotFoundError(f"No '{suffix}' matrix found under {sample_dir}")
+        raise FileNotFoundError(f"No exact '{level}tes_MATRIX' folder found under {sample_dir}")
+    if len(matches) > 1:
+        raise RuntimeError(f"Ambiguous match for level '{level}' under {sample_dir}: {matches}")
+    print(f"  using SoloTE matrix folder: {matches[0].name}")
     return matches[0]
 
 
