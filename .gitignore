@@ -32,3 +32,5 @@ err.*.err
 .DS_Store
 *.swp
 *.ipynb
+outputs/
+session/
