@@ -7,6 +7,10 @@
 #       format_name: percent
 #       format_version: '1.3'
 #       jupytext_version: 1.19.4
+#   kernelspec:
+#     display_name: visiumhd
+#     language: python
+#     name: python3
 # ---
 
 # %% [markdown]
@@ -35,37 +39,50 @@ for s in samples:
     print(s, a.shape)
 
 # %% [markdown]
-# ## 2. QC metrics + raw TE burden per bin
+# ## 2. QC metrics: counts, genes, mitochondrial %, and raw TE burden per bin
+# All core QC metrics computed together, so filtering decisions (step 6) can
+# be made looking at the full picture at once, not metric-by-metric.
 
 # %%
 for s, a in adatas.items():
-    sc.pp.calculate_qc_metrics(a, percent_top=None, log1p=True, inplace=True)
+    a.var["mt"] = a.var_names.str.lower().str.startswith("mt-")
+    sc.pp.calculate_qc_metrics(a, qc_vars=["mt"], percent_top=None, log1p=True, inplace=True)
+
     te_features = [v for v in a.var_names if "SoloTE" in v]
     te_idx = [a.var_names.get_loc(f) for f in te_features]
     a.obs["TE_burden"] = np.asarray(a.X[:, te_idx].sum(axis=1)).flatten()
     a.obs["log1p_TE_burden"] = np.log1p(a.obs["TE_burden"])
-    print(s, "TE features:", len(te_features), "| median TE burden:", np.median(a.obs["TE_burden"]))
+
+    print(
+        s,
+        "| mt genes:", a.var["mt"].sum(),
+        "| TE features:", len(te_features),
+        "| median TE burden:", np.median(a.obs["TE_burden"]),
+        "| median pct_counts_mt:", np.median(a.obs["pct_counts_mt"]),
+    )
 
 # %% [markdown]
 # ## 3. Combine QC metrics across samples for comparison
 
 # %%
 qc_df = pd.concat([
-    a.obs[["total_counts", "n_genes_by_counts", "TE_burden", "log1p_TE_burden"]].assign(sample=s)
+    a.obs[["total_counts", "n_genes_by_counts", "pct_counts_mt", "TE_burden", "log1p_TE_burden"]].assign(sample=s)
     for s, a in adatas.items()
-], axis=0)
+], axis=0).reset_index(drop=True)
 
-print(qc_df.groupby("sample")[["total_counts", "n_genes_by_counts", "TE_burden"]].median())
+print(qc_df.groupby("sample")[["total_counts", "n_genes_by_counts", "pct_counts_mt", "TE_burden"]].median())
 
 # %% [markdown]
 # ## 4. Violin plots — raw QC metrics, 6 samples side by side
+# Four panels together: total counts, genes detected, TE burden, and
+# mitochondrial % — the full picture in one view.
 
 # %%
-fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+fig, axes = plt.subplots(1, 4, figsize=(26, 6))
 for ax, metric, title in zip(
     axes,
-    ["total_counts", "n_genes_by_counts", "log1p_TE_burden"],
-    ["Total counts per bin", "Genes detected per bin", "log1p(TE burden) per bin"],
+    ["total_counts", "n_genes_by_counts", "log1p_TE_burden", "pct_counts_mt"],
+    ["Total counts per bin", "Genes detected per bin", "log1p(TE burden) per bin", "% mitochondrial counts per bin"],
 ):
     sns.violinplot(data=qc_df, x="sample", y=metric, ax=ax, cut=0, inner="quartile")
     ax.set_title(title)
@@ -74,7 +91,7 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# ## 5. Spatial plots — raw TE burden (log1p), 6 samples
+# ## 5. Spatial plots — raw TE burden and mitochondrial % side by side
 
 # %%
 fig, axes = plt.subplots(2, 3, figsize=(18, 12))
@@ -90,6 +107,25 @@ for ax, s in zip(axes, samples):
     ax.axis("off")
     ax.set_title(s)
     plt.colorbar(sca, ax=ax, shrink=0.6, label="log1p(TE burden)")
+plt.suptitle("TE burden (raw, log1p)", y=1.02)
+plt.tight_layout()
+plt.show()
+
+# %%
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+axes = axes.flatten()
+for ax, s in zip(axes, samples):
+    a = adatas[s]
+    coords = a.obsm["spatial"]
+    vals = a.obs["pct_counts_mt"].values
+    vmax = np.percentile(vals, 99)
+    sca = ax.scatter(coords[:, 0], coords[:, 1], c=vals, s=8, cmap="magma", vmin=0, vmax=vmax, alpha=0.85)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(s)
+    plt.colorbar(sca, ax=ax, shrink=0.6, label="% mt counts")
+plt.suptitle("Mitochondrial % per bin", y=1.02)
 plt.tight_layout()
 plt.show()
 
@@ -97,7 +133,9 @@ plt.show()
 # ## 6. QC filtering — MAD-based outlier removal (per sample)
 # Fixed thresholds don't transfer across samples with very different depth
 # (e.g. Injured-1hrs vs Control-Old) -- MAD adapts to each sample's own
-# distribution instead.
+# distribution instead. Currently filtering on total_counts and n_genes;
+# pct_counts_mt is visualized above but not yet used as a filter criterion
+# -- decide after reviewing whether it shows a spatially localized artifact.
 
 # %%
 def mad_outlier(values, nmads=5):
@@ -113,6 +151,30 @@ for s, a in adatas.items():
     a_f = a[keep].copy()
     filtered_adatas[s] = a_f
     print(s, a.shape, "->", a_f.shape, f"({keep.sum()/len(keep)*100:.1f}% kept)")
+
+# %% [markdown]
+# ## 6b. Spatial check — where are the discarded bins?
+# If discarded bins cluster in one region (tissue edge, fold, bubble) rather
+# than being scattered randomly, that's a localized technical artifact worth
+# flagging -- not just random noise.
+
+# %%
+fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+axes = axes.flatten()
+for ax, s in zip(axes, samples):
+    a = adatas[s]
+    outlier_counts = mad_outlier(a.obs["total_counts"], nmads=5)
+    outlier_genes = mad_outlier(a.obs["n_genes_by_counts"], nmads=5)
+    is_outlier = (outlier_counts | outlier_genes).values
+    coords = a.obsm["spatial"]
+    ax.scatter(coords[~is_outlier, 0], coords[~is_outlier, 1], c="lightgray", s=4, alpha=0.4)
+    ax.scatter(coords[is_outlier, 0], coords[is_outlier, 1], c="red", s=6, alpha=0.8)
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(f"{s} ({is_outlier.sum()} discarded)")
+plt.tight_layout()
+plt.show()
 
 # %% [markdown]
 # ## 7. Normalization — per sample (normalize_total + log1p)
@@ -145,7 +207,7 @@ for s, a in normalized_adatas.items():
 qc_df_norm = pd.concat([
     a.obs[["total_counts", "n_genes_by_counts", "TE_burden_norm"]].assign(sample=s)
     for s, a in normalized_adatas.items()
-], axis=0)
+], axis=0).reset_index(drop=True)
 
 print(qc_df_norm.groupby("sample")["TE_burden_norm"].median())
 
@@ -218,7 +280,8 @@ for s, a in normalized_adatas.items():
 
 qc_df_frac = pd.concat([
     a.obs[["TE_fraction"]].assign(sample=s) for s, a in normalized_adatas.items()
-], axis=0)
+], axis=0).reset_index(drop=True)
+
 print(qc_df_frac.groupby("sample")["TE_fraction"].median())
 
 # %% [markdown]
