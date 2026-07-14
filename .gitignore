@@ -34,3 +34,4 @@ err.*.err
 *.ipynb
 outputs/
 session/
+*.html
