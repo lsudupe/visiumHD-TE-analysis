@@ -58,14 +58,30 @@ def plot_spatial_te(ax, coords, vals, title, vmax=None, cmap="magma_r", label=""
 # ## 1. Load bin-level objects (post-StarDist, both expansion algorithms)
 
 # %%
-samples = ["Control-GER", "Control-Old", "Injured-1hrs", "Injured-3hrs", "Injured-12hrs", "Injured-24hrs"]
+samples = ["Control-GER", "Control-Old", "Injured-1hrs", "Injured-3hrs", "Injured-12hrs", "Injured-24hrs", "ST0001", "ST0002"]
+
+sample_labels = {
+    "Control-GER": "Control (geriatric)",
+    "Control-Old": "Control (old)",
+    "ST0002": "Control (young)",
+    "ST0001": "Injured, 6h",
+    "Injured-1hrs": "Injured, 1h",
+    "Injured-3hrs": "Injured, 3h",
+    "Injured-12hrs": "Injured, 12h",
+    "Injured-24hrs": "Injured, 24h",
+}
+
+import math
+N_COLS = 4
+N_ROWS = math.ceil(len(samples) / N_COLS)
 
 bin_adatas = {}
 for s in samples:
     a = sc.read_h5ad(f"/ibex/user/medinils/data/objects/{s}_family_stardist_bins.h5ad")
+    a.obs["condition_label"] = sample_labels[s]
     bin_adatas[s] = a
     n_nuclei = (a.obs["labels_he"] > 0).sum()
-    print(s, a.shape, "| bins with a nucleus label:", n_nuclei)
+    print(s, "->", sample_labels[s], "|", a.shape, "| bins with a nucleus label:", n_nuclei)
 
 # %% [markdown]
 # ## 1a. Compare raw image vs. the two expansion algorithms, all 6 samples
@@ -73,7 +89,7 @@ for s in samples:
 # -> expanded (distance-based) -> expanded (volume_ratio).
 
 # %%
-fig, axes = plt.subplots(6, 4, figsize=(24, 30), dpi=70)
+fig, axes = plt.subplots(len(samples), 4, figsize=(24, 5 * len(samples)), dpi=70)
 
 for row, s in enumerate(samples):
     a = bin_adatas[s]
@@ -137,7 +153,8 @@ for s, a in bin_adatas.items():
 # neighbouring cells into one label)?
 
 # %%
-fig, axes = plt.subplots(1, 6, figsize=(28, 4))
+fig, axes = plt.subplots(N_ROWS, N_COLS, figsize=(6 * N_COLS, 6 * N_ROWS))
+axes = axes.flatten()
 for ax, s in zip(axes, samples):
     a = cell_adatas[s]
     ax.hist(a.obs["bin_count"], bins=50, color="#02C39A", alpha=0.8)
@@ -202,7 +219,6 @@ print(qc_df.groupby("sample")[["total_counts", "n_genes_by_counts", "pct_counts_
 # correlates with high total_counts/n_genes/pct_counts_mt as expected for
 # genuinely larger cells, or looks decoupled (possible segmentation error).
 
-# %%
 # %%
 MIN_COUNTS_FLOOR = 10
 BIN_COUNT_P99 = qc_df["bin_count"].quantile(0.99)
@@ -322,7 +338,7 @@ for cell_id in largest.index:
 # cells) -- would support adding an upper bin_count cutoff.
 
 # %%
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig, axes = plt.subplots(N_ROWS, N_COLS, figsize=(6 * N_COLS, 6 * N_ROWS))
 axes = axes.flatten()
 for ax, s in zip(axes, samples):
     a = cell_adatas[s]
@@ -374,7 +390,7 @@ plt.show()
 # ## 5. Spatial plots — raw TE burden and mitochondrial % side by side
 
 # %%
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig, axes = plt.subplots(N_ROWS, N_COLS, figsize=(6 * N_COLS, 6 * N_ROWS))
 axes = axes.flatten()
 for ax, s in zip(axes, samples):
     a = cell_adatas[s]
@@ -385,7 +401,7 @@ plt.tight_layout()
 plt.show()
 
 # %%
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig, axes = plt.subplots(N_ROWS, N_COLS, figsize=(6 * N_COLS, 6 * N_ROWS))
 axes = axes.flatten()
 for ax, s in zip(axes, samples):
     a = cell_adatas[s]
@@ -396,16 +412,85 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# ## 6. QC filtering — floor only (NOT MAD two-sided)
-# Distributions may be bimodal (real biological populations, not just
-# low-quality artifacts) -- a two-sided MAD filter would systematically
-# remove one whole population. Only drop truly empty/degenerate cells.
-# Ana's bin_count<=2 filter was already applied in section 1c.
-# (MIN_COUNTS_FLOOR defined in section 3a.)
+# ## 6a. Distributions and where the floor falls, per sample
 
 # %%
 MIN_COUNTS_FLOOR = 10
-MAX_PCT_MT = 40
+
+fig, axes = plt.subplots(2, N_COLS, figsize=(6 * N_COLS, 8))
+for col, s in enumerate(samples):
+    a = cell_adatas[s]
+    for row, (metric, label) in enumerate([
+        ("total_counts", "Total counts"),
+        ("n_genes_by_counts", "Genes detected"),
+    ]):
+        ax = axes[row, col]
+        ax.hist(a.obs[metric], bins=60, color="#028090", alpha=0.75)
+        if metric == "total_counts":
+            ax.axvline(MIN_COUNTS_FLOOR, color="#C97B2E", linestyle="--", linewidth=1.2, label="floor")
+        if row == 0:
+            ax.set_title(s, fontsize=10)
+        ax.set_xlabel(label, fontsize=8)
+        ax.tick_params(labelsize=7)
+        if col == 0:
+            ax.legend(fontsize=7)
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ## 6b. Comparing mitochondrial thresholds — 25% vs 40%
+# Exploration only -- no filter applied yet. This informs the MAX_PCT_MT
+# choice used below in 6d.
+
+# %%
+MT_THRESHOLDS = [25, 40]
+
+comparison_rows = []
+for s in samples:
+    a = cell_adatas[s]  # unfiltered
+    for mt_thresh in MT_THRESHOLDS:
+        keep = (a.obs["total_counts"] >= MIN_COUNTS_FLOOR) & (a.obs["pct_counts_mt"] <= mt_thresh)
+        lost = ~keep
+        comparison_rows.append({
+            "sample": s,
+            "mt_threshold": mt_thresh,
+            "cells_kept": keep.sum(),
+            "cells_lost": lost.sum(),
+            "%_lost": round(lost.sum() / len(keep) * 100, 1),
+            "median_total_counts_lost": a.obs.loc[lost, "total_counts"].median() if lost.sum() > 0 else None,
+            "median_total_counts_kept": a.obs.loc[keep, "total_counts"].median(),
+        })
+
+comparison_df = pd.DataFrame(comparison_rows)
+print(comparison_df.to_string(index=False))
+
+# %% [markdown]
+# ## 6c. Spatial — which cells are lost at each threshold
+
+# %%
+fig, axes = plt.subplots(len(samples), 2, figsize=(12, 5 * len(samples)))
+for row, s in enumerate(samples):
+    a = cell_adatas[s]
+    coords = a.obsm["spatial"]
+    for col, mt_thresh in enumerate(MT_THRESHOLDS):
+        keep = (a.obs["total_counts"] >= MIN_COUNTS_FLOOR) & (a.obs["pct_counts_mt"] <= mt_thresh)
+        ax = axes[row, col]
+        ax.scatter(coords[keep, 0], coords[keep, 1], c="lightgray", s=6, alpha=0.5)
+        ax.scatter(coords[~keep, 0], coords[~keep, 1], c="#8B0000", s=8, alpha=0.85)
+        ax.invert_yaxis()
+        ax.set_aspect("equal")
+        ax.axis("off")
+        ax.set_title(f"{s} — mt<={mt_thresh}% ({(~keep).sum()} lost)")
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ## 6d. Apply the chosen filter (floor + mitochondrial cap)
+# Decision informed by 6b/6c above. Ana's bin_count<=2 filter was already
+# applied in section 1c.
+
+# %%
+MAX_PCT_MT = 35  # <- adjust here based on what 6b/6c showed
 
 filtered_cell_adatas = {}
 for s, a in cell_adatas.items():
@@ -466,7 +551,7 @@ plt.show()
 # ## 10. Spatial plots — which cells survive filtering, per sample
 
 # %%
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig, axes = plt.subplots(N_ROWS, N_COLS, figsize=(6 * N_COLS, 6 * N_ROWS))
 axes = axes.flatten()
 for ax, s in zip(axes, samples):
     a = cell_adatas[s]  # objeto ANTES de filtrar, con todas las células
@@ -515,7 +600,7 @@ print(qc_df_frac.groupby("sample")["TE_fraction"].median())
 # ## 12. Spatial plots — TE fraction (%)
 
 # %%
-fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+fig, axes = plt.subplots(N_ROWS, N_COLS, figsize=(6 * N_COLS, 6 * N_ROWS))
 axes = axes.flatten()
 for ax, s in zip(axes, samples):
     a = normalized_cell_adatas[s]
@@ -567,15 +652,186 @@ print("\nTotal cells, all samples, after full filtering:", summary_df["cells_fin
 print("Merged object (section 13):", adata_merged_cell.shape)
 
 # %% [markdown]
-# ## Compare against the two earlier pipelines
-# - Bin-level (8um, young_preprocessing.py): strong "V" pattern, likely
-#   confounded by depth/composition.
-# - Cell-level, Cellpose + real H&E image (per Core Labs, same image as
-#   StarDist here): ~2,994 cells for Control-GER.
-# - Cell-level, StarDist + real H&E image (this notebook): ~13,000 cells
-#   for Control-GER -- same source image as Cellpose, so the ~4.3x
-#   difference reflects the segmentation algorithms/thresholds themselves,
-#   not image resolution as first assumed.
-# - Nucleus-vs-cytoplasm TE localization check (done separately) found no
-#   evidence of cytoplasmic enrichment beyond what compartment size alone
-#   explains, consistently across all 6 samples.
+# ## EXPLORATION — combining StarDist + Cellpose segmentation (Control-GER only)
+#  StarDist captures many more nuclei (~13,000 vs ~2,994 for Cellpose), but
+#  seems biased toward large myonuclear domains. Testing whether combining
+#  both recovers more of the interstitial (immune/stromal) space.
+
+# %%
+SAMPLE_TEST = "Control-GER"
+a_test = bin_adatas[SAMPLE_TEST].copy()
+
+# load Cellpose's cell_id from barcode_mappings.parquet
+mapping = pd.read_parquet(f"/ibex/user/medinils/data/samples/{SAMPLE_TEST}/barcode_mappings.parquet")
+mapping = mapping[["square_002um", "cell_id"]].dropna(subset=["cell_id"])
+mapping = mapping.set_index("square_002um")["cell_id"]
+
+a_test.obs["labels_cellpose"] = mapping.reindex(a_test.obs_names).values
+print("bins with StarDist label:", (a_test.obs["labels_expanded_volume"] > 0).sum())
+print("bins with Cellpose label:", a_test.obs["labels_cellpose"].notna().sum())
+print("bins with BOTH:", ((a_test.obs["labels_expanded_volume"] > 0) & a_test.obs["labels_cellpose"].notna()).sum())
+print("bins with NEITHER:", ((a_test.obs["labels_expanded_volume"] == 0) & a_test.obs["labels_cellpose"].isna()).sum())
+
+# %%
+SAMPLE_TEST = "Control-GER"
+a_test = bin_adatas[SAMPLE_TEST].copy()
+
+# recorte pequeño, centrado en la muestra (ajusta el rango si hace falta)
+row_mid = a_test.obs["array_row"].median()
+col_mid = a_test.obs["array_col"].median()
+mask = (
+    (a_test.obs["array_row"] >= row_mid - 15) & (a_test.obs["array_row"] <= row_mid + 15) &
+    (a_test.obs["array_col"] >= col_mid - 15) & (a_test.obs["array_col"] <= col_mid + 15)
+)
+
+# añade labels_cellpose si no lo has hecho ya en esta sesión
+mapping = pd.read_parquet(f"/ibex/user/medinils/data/samples/{SAMPLE_TEST}/barcode_mappings.parquet")
+mapping = mapping[["square_002um", "cell_id"]].dropna(subset=["cell_id"])
+mapping = mapping.set_index("square_002um")["cell_id"]
+a_test.obs["labels_cellpose"] = mapping.reindex(a_test.obs_names).values
+
+fig, axes = plt.subplots(1, 3, figsize=(21, 7))
+
+# 1. Solo H&E, sin overlay
+bdata_raw = a_test[mask].copy()
+sc.pl.spatial(bdata_raw, color=[None], show=False, ax=axes[0],
+              img_key="0.5_mpp_150_buffer", basis="spatial_cropped_150_buffer")
+axes[0].set_title("Raw H&E")
+
+# 2. Cellpose
+bdata_cp = a_test[mask].copy()
+bdata_cp = bdata_cp[bdata_cp.obs["labels_cellpose"].notna()]
+bdata_cp.obs["labels_cellpose"] = bdata_cp.obs["labels_cellpose"].astype(str)
+sc.pl.spatial(bdata_cp, color=["labels_cellpose"], show=False, ax=axes[1],
+              img_key="0.5_mpp_150_buffer", basis="spatial_cropped_150_buffer", legend_loc=None)
+axes[1].set_title("Cellpose")
+
+# 3. StarDist
+bdata_sd = a_test[mask].copy()
+bdata_sd = bdata_sd[bdata_sd.obs["labels_expanded_volume"] > 0]
+bdata_sd.obs["labels_expanded_volume"] = bdata_sd.obs["labels_expanded_volume"].astype(str)
+sc.pl.spatial(bdata_sd, color=["labels_expanded_volume"], show=False, ax=axes[2],
+              img_key="0.5_mpp_150_buffer", basis="spatial_cropped_150_buffer", legend_loc=None)
+axes[2].set_title("StarDist")
+
+plt.tight_layout()
+plt.show()
+
+# %%
+row_mid2 = a_test.obs["array_row"].quantile(0.3)  # otra zona, no el centro
+col_mid2 = a_test.obs["array_col"].quantile(0.7)
+mask2 = (
+    (a_test.obs["array_row"] >= row_mid2 - 15) & (a_test.obs["array_row"] <= row_mid2 + 15) &
+    (a_test.obs["array_col"] >= col_mid2 - 15) & (a_test.obs["array_col"] <= col_mid2 + 15)
+)
+
+fig, axes = plt.subplots(1, 3, figsize=(21, 7))
+bdata_raw = a_test[mask2].copy()
+sc.pl.spatial(bdata_raw, color=[None], show=False, ax=axes[0], img_key="0.5_mpp_150_buffer", basis="spatial_cropped_150_buffer")
+axes[0].set_title("Raw H&E")
+
+bdata_cp = a_test[mask2].copy()
+bdata_cp = bdata_cp[bdata_cp.obs["labels_cellpose"].notna()]
+bdata_cp.obs["labels_cellpose"] = bdata_cp.obs["labels_cellpose"].astype(str)
+sc.pl.spatial(bdata_cp, color=["labels_cellpose"], show=False, ax=axes[1], img_key="0.5_mpp_150_buffer", basis="spatial_cropped_150_buffer", legend_loc=None)
+axes[1].set_title("Cellpose")
+
+bdata_sd = a_test[mask2].copy()
+bdata_sd = bdata_sd[bdata_sd.obs["labels_expanded_volume"] > 0]
+bdata_sd.obs["labels_expanded_volume"] = bdata_sd.obs["labels_expanded_volume"].astype(str)
+sc.pl.spatial(bdata_sd, color=["labels_expanded_volume"], show=False, ax=axes[2], img_key="0.5_mpp_150_buffer", basis="spatial_cropped_150_buffer", legend_loc=None)
+axes[2].set_title("StarDist")
+plt.tight_layout()
+plt.show()
+
+# %%
+mt_genes = [g for g in a_test.var_names if g.lower().startswith("mt-")]
+muscle_markers = [g for g in ["Myh1", "Myh2", "Acta1", "Ttn", "Des"] if g in a_test.var_names]
+te_features = [g for g in a_test.var_names if "SoloTE" in g]
+
+neutrophil_markers = [g for g in ["S100a8", "S100a9", "Ly6g", "Mpo"] if g in a_test.var_names]
+m1_macrophage_markers = [g for g in ["Nos2", "Cd68", "Cd86", "Il1b", "Tnf"] if g in a_test.var_names]
+m2_macrophage_markers = [g for g in ["Cd163", "Mrc1", "Arg1"] if g in a_test.var_names]
+satellite_cell_markers = [g for g in ["Pax7", "Myf5", "Myod1", "Cdh15"] if g in a_test.var_names]
+fap_markers = [g for g in ["Pdgfra", "Ly6a", "Dcn"] if g in a_test.var_names]
+
+marker_panels = {
+    "neutrophil": neutrophil_markers,
+    "M1_macrophage": m1_macrophage_markers,
+    "M2_macrophage": m2_macrophage_markers,
+    "satellite_cell": satellite_cell_markers,
+    "FAP": fap_markers,
+    "muscle": muscle_markers,
+}
+
+def summarize_by_label(adata_crop, label_col):
+    rows = []
+    for label in adata_crop.obs[label_col].dropna().unique():
+        sub = adata_crop[adata_crop.obs[label_col] == label]
+        total_counts = np.asarray(sub.X.sum(axis=1)).flatten().sum()
+        n_genes = (np.asarray(sub.X.sum(axis=0)).flatten() > 0).sum()
+        mt_counts = np.asarray(sub[:, mt_genes].X.sum(axis=1)).flatten().sum() if mt_genes else 0
+        pct_mt = (mt_counts / total_counts * 100) if total_counts > 0 else 0
+        te_sum = np.asarray(sub[:, te_features].X.sum()).flatten()[0] if te_features else 0
+
+        row = {
+            "label": label, "n_bins": sub.n_obs, "total_counts": total_counts,
+            "n_genes": n_genes, "pct_mt": round(pct_mt, 1), "TE_total": round(te_sum, 2),
+        }
+        for name, genes in marker_panels.items():
+            val = np.asarray(sub[:, genes].X.sum()).flatten()[0] if genes else 0
+            row[name] = round(val, 2)
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("n_bins", ascending=False)
+
+print("=== IF WE USE CELLPOSE (this crop) ===")
+print(summarize_by_label(crop, "labels_cellpose").to_string(index=False))
+
+print("\n=== IF WE USE STARDIST (this crop) ===")
+print(summarize_by_label(crop, "labels_expanded_volume").to_string(index=False))
+
+# %%
+fig, axes = plt.subplots(2, 5, figsize=(28, 10))
+
+marker_names = ["neutrophil", "M1_macrophage", "M2_macrophage", "satellite_cell", "FAP"]
+
+for col, marker in enumerate(marker_names):
+    # Cellpose
+    ax = axes[0, col]
+    ax.scatter(cellpose_summary["muscle"], cellpose_summary[marker], s=4, alpha=0.3, color="#028090")
+    ax.set_xlabel("muscle")
+    ax.set_ylabel(marker)
+    ax.set_title(f"Cellpose: muscle vs {marker}")
+
+    # StarDist
+    ax = axes[1, col]
+    ax.scatter(stardist_summary["muscle"], stardist_summary[marker], s=4, alpha=0.3, color="#C97B2E")
+    ax.set_xlabel("muscle")
+    ax.set_ylabel(marker)
+    ax.set_title(f"StarDist: muscle vs {marker}")
+
+plt.tight_layout()
+plt.show()
+
+# %%
+fig, axes = plt.subplots(1, 5, figsize=(24, 5))
+
+for ax, marker in zip(axes, marker_names):
+    cp_purity = cellpose_summary[marker] / (cellpose_summary[marker] + cellpose_summary["muscle"] + 1e-9)
+    sd_purity = stardist_summary[marker] / (stardist_summary[marker] + stardist_summary["muscle"] + 1e-9)
+
+    # solo células que tienen ALGO de este marcador (evita que el mar de ceros tape el plot)
+    cp_purity_pos = cp_purity[cellpose_summary[marker] > 0]
+    sd_purity_pos = sd_purity[stardist_summary[marker] > 0]
+
+    data = pd.DataFrame({
+        "purity": pd.concat([cp_purity_pos, sd_purity_pos], ignore_index=True),
+        "method": ["Cellpose"] * len(cp_purity_pos) + ["StarDist"] * len(sd_purity_pos),
+    })
+    sns.violinplot(data=data, x="method", y="purity", ax=ax, cut=0, inner="quartile",
+                    palette={"Cellpose": "#028090", "StarDist": "#C97B2E"})
+    ax.set_title(marker)
+    ax.set_ylabel("marker / (marker + muscle)")
+
+plt.tight_layout()
+plt.show()
