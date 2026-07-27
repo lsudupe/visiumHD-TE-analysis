@@ -26,6 +26,64 @@
 #
 # No mitochondrial filter is applied here (Finding #9: decided after
 # clustering).
+#
+# ## Change log (this revision)
+# 1. **Removed the checkpoint auto-resume mechanism entirely.** The old
+#    `USE_CHECKPOINT = os.path.exists(CHECKPOINT)` silently skipped Sections
+#    1a-6 (QC filter, HVG, PCA, Harmony, Leiden) whenever a stale checkpoint
+#    file happened to exist on disk. Confirmed on the object that had been
+#    produced this way: recomputing each group's own 5th percentile of
+#    `n_genes_by_counts` and checking what fraction fell below it came back
+#    at ~5% everywhere, which is only possible if the Section 1a filter had
+#    never actually run. Every section below now always executes, top to
+#    bottom, from the raw unclustered merged object.
+# 2. **Fixed `sample_to_condition`**: ST0001=Injured-6hrs, ST0002=
+#    Control-young (was silently swapped).
+# 3. **Section 1a filter extended**: quantile-5 cutoff on BOTH
+#    `n_genes_by_counts` AND `total_counts` (previously genes only), each
+#    computed independently per `(sample, labels_joint_source)` group, plus
+#    a hard `MIN_GENES_FLOOR=20` on top. This resolved a KNN-graph
+#    fragmentation problem (23-32 disconnected components) down to 1 --
+#    see Section 5a.
+# 4. **Section 6g (finalize clusters) generalized**: tiny clusters by
+#    `MIN_CLUSTER_SIZE` AND clusters with no clean marker in the dotplot
+#    (`NO_MARKER_CLUSTERS`, filled in by hand after inspecting Section 6f's
+#    output on THIS run -- cluster IDs are not stable across reruns, do not
+#    reuse IDs from a previous session) both get folded into
+#    `low_confidence`, instead of a size-only cut.
+# 5. **New Section 6h**: drops `low_confidence` cells and recomputes
+#    neighbors + UMAP before the final save, so the saved embedding isn't
+#    still shaped by cells that were ultimately excluded from annotation.
+# 6. **Removed the old Sections 8/9** (score_genes panels + t-test DE,
+#    inline here). Superseded by the separate `cell_type_annotation.py`,
+#    which does the same job with z-scored panel heatmaps, a candidate-
+#    identity table, filtered rank_genes_groups, and CSV exports -- no
+#    reason to duplicate a weaker version of it here.
+#
+# **Tried and reverted**: a `sc.pp.regress_out(["total_counts",
+# "pct_counts_mt"])` step before PCA was added and then removed. Two
+# reasons: (a) it silently corrupted `adata.X` for every downstream use
+# that assumes log1p-normalized values (rank_genes_groups' logfoldchanges
+# came back NaN for ~30/32 clusters -- regress_out produces residuals,
+# which can be negative, and expm1() on a negative residual breaks the
+# fold-change math); (b) even before that was caught, comparing the
+# silhouette sweep with vs. without it showed no real difference
+# (-0.033/-0.010/0.001/0.012/0.027/0.026/0.019 vs. -0.030/-0.007/-0.002/
+# 0.008/0.012/0.020/0.020 across the same 7 resolutions) -- the "rays" in
+# the UMAP were a real depth effect, but not one that was hurting the
+# actual clustering quality in the space Leiden runs on, just how it
+# looks projected to 2D. Not worth the corrupted-X risk for a purely
+# cosmetic fix. If this gets revisited, don't overwrite `adata.X` in
+# place -- write to a separate layer and point PCA's `layer=` argument at
+# it instead, leaving `adata.X` untouched for DE/dotplots.
+#
+# **IMPORTANT**: because of the filter changes (#3), every downstream
+# number from a previous session (n_pcs, resolution, cluster IDs,
+# marker-less cluster IDs) is stale and gets re-derived by actually running
+# the notebook again -- nothing below is hardcoded from a prior run except
+# where explicitly noted as "empirically confirmed on THIS filter" (n_pcs=15
+# gave 1 connected component, confirmed twice independently -- with and
+# without the reverted regress_out step, same result both times).
 
 # %%
 import scanpy as sc
@@ -38,27 +96,17 @@ import squidpy as sq
 import harmonypy as hm
 from sklearn.metrics import silhouette_score
 from scipy.stats import entropy
-import os
 
 # %% [markdown]
-# ## 1. Load merged object (or resume from checkpoint)
-# If Harmony/Leiden were already run and saved (Section 6g), load that
-# checkpoint directly and skip to Section 7 (annotation) -- avoids
-# recomputing HVG/PCA/Harmony/Leiden every time the notebook is reopened.
-# Set USE_CHECKPOINT = False to force a full recompute (e.g. after
-# changing HVG/theta/resolution parameters upstream).
+# ## 1. Load merged object
+# No checkpoint/resume mechanism -- runs end to end every time (QC filter
+# -> HVG -> PCA -> Harmony -> Leiden -> annotation), always from the raw
+# unclustered merged object. This filter is not optional, so there is no
+# correct default that skips it.
 
 # %%
-CHECKPOINT = "/ibex/user/medinils/data/objects/all_samples_family_stardist_cell_clustered_checkpoint.h5ad"
-USE_CHECKPOINT = os.path.exists(CHECKPOINT)
-
-if USE_CHECKPOINT:
-    adata = sc.read_h5ad(CHECKPOINT)
-    print("Loaded from checkpoint:", adata)
-    print("Clusters already computed:", "clusters" in adata.obs.columns)
-else:
-    adata = sc.read_h5ad("/ibex/user/medinils/data/objects/all_samples_family_stardist_cell_normalized_merged.h5ad")
-    print("Loaded from the original (unclustered) merged object:", adata)
+adata = sc.read_h5ad("/ibex/user/medinils/data/objects/all_samples_family_stardist_cell_normalized_merged.h5ad")
+print("Loaded from the original (unclustered) merged object:", adata)
 
 samples = ["Control-GER", "Control-Old", "Injured-1hrs", "Injured-3hrs",
            "Injured-12hrs", "Injured-24hrs", "ST0001", "ST0002"]
@@ -66,6 +114,9 @@ samples = ["Control-GER", "Control-Old", "Injured-1hrs", "Injured-3hrs",
 # condition_label was never actually saved as a column in the merged
 # object (only existed as a plotting-label dict in qc_stardist_cell.py) --
 # rebuild it here from `sample`, since it's 1:1 in this design.
+# Correct mapping, per explicit confirmation: ST0001=Injured-6hrs,
+# ST0002=Control-young (matches qc_stardist_cell.py's own sample_labels
+# dict). Previously swapped here -- fixed.
 sample_to_condition = {
     "Control-GER": "Control-GER",
     "Control-Old": "Control-Old",
@@ -73,8 +124,8 @@ sample_to_condition = {
     "Injured-3hrs": "Injured-3hrs",
     "Injured-12hrs": "Injured-12hrs",
     "Injured-24hrs": "Injured-24hrs",
-    "ST0001": "Control-young",
-    "ST0002": "Injured-6hrs",
+    "ST0001": "Injured-6hrs",
+    "ST0002": "Control-young",
 }
 adata.obs["condition_label"] = adata.obs["sample"].map(sample_to_condition).astype("category")
 print(adata.obs["condition_label"].value_counts())
@@ -87,9 +138,8 @@ print(adata.obs["sample"].value_counts())
 # ## 1a. Additional QC filter — per-(sample, labels_joint_source) lower-tail threshold
 # The original qc_stardist_cell.py filter (Section 6d) only applied a floor
 # of 10 raw UMIs, no minimum on genes detected. Too permissive: caused
-# ~2500 disconnected KNN-graph components downstream in Section 6
-# (isolated cells with median 10 genes detected that no Leiden resolution
-# could merge into the main graph -- see connected_components diagnostic).
+# disconnected KNN-graph components downstream (isolated cells that no
+# Leiden resolution could merge into the main graph).
 #
 # A single fixed threshold (first attempt: MIN_COUNTS_FLOOR_EXTRA=100,
 # MIN_GENES=50) doesn't work here for two compounding reasons, confirmed
@@ -98,9 +148,7 @@ print(adata.obs["sample"].value_counts())
 #      cutoff, Control-GER lost 16.9% vs. Injured-1hrs 54.2% -- a ~3.2x gap
 #      not explained by primary/secondary composition (nearly identical,
 #      0.71-0.85 primary fraction across all 8 samples). Injured-1h/3h/12h
-#      are all substantially lower-depth than controls (Injured-12hrs was
-#      not previously documented as such in PROJECT_CONTEXT.md Section 2 --
-#      worth flagging as a new finding).
+#      are all substantially lower-depth than controls.
 #   2. primary/secondary scale mismatch WITHIN the same sample: e.g.
 #      Control-GER primary median ~190 vs. secondary median ~2100
 #      total_counts -- any shared cutoff always penalizes primary
@@ -109,56 +157,73 @@ print(adata.obs["sample"].value_counts())
 #
 # Fix: compute the percentile threshold independently within each
 # (sample, labels_joint_source) group, cutting only the LOW tail (no upper
-# cap -- we don't want to remove genuinely large/high-signal cells). This
-# equalizes the fraction lost across all 16 groups, removing both
-# confounds at once. Using n_genes_by_counts only (not total_counts too --
-# the two are highly correlated, so cutting on both at once would remove
-# more than the nominal percentile per group in an uncontrolled way).
-# n_genes_by_counts was also the metric that best explained the KNN-graph
-# fragmentation in Section 6z.
+# cap -- we don't want to remove genuinely large/high-signal cells).
+#
+# Filters on BOTH n_genes_by_counts AND total_counts, each with its own
+# quantile-5 threshold computed separately per (sample, source) group, kept
+# only if a cell passes both -- a cell can be low-UMI/high-gene-diversity
+# or high-UMI/low-gene-diversity (e.g. one dominant transcript, see Section
+# 4a/4b), so the two metrics aren't fully redundant.
+#
+# Plus a hard absolute floor (MIN_GENES_FLOOR=20) on top: the per-group 5th
+# percentile alone still let very-low-complexity cells through in low-depth
+# groups (e.g. Injured-1h/3h, where even the 5th percentile of
+# n_genes_by_counts sits at 10-16). This absolute floor is what actually
+# resolved the KNN-graph fragmentation (Section 5a: 23-32 connected
+# components -> 1, empirically confirmed).
 #
 # This is a deliberate trade-off (relative per-group cutoff vs. a single
 # "objective" number) -- document in PROJECT_CONTEXT.md.
 
 # %%
-if not USE_CHECKPOINT:
-    QUALITY_PERCENTILE = 5  # drop the bottom 5% of n_genes_by_counts, within each (sample, source) group
+QUALITY_PERCENTILE = 5  # drop the bottom 5% of EACH metric, within each (sample, source) group
+FILTER_METRICS = ["n_genes_by_counts", "total_counts"]
+MIN_GENES_FLOOR = 20  # hard absolute floor, on top of the per-group quantile cuts below
 
-    keep_1a = pd.Series(False, index=adata.obs_names, dtype=bool)
-    threshold_log = []
-    for s in samples:
-        for src in adata.obs["labels_joint_source"].unique():
-            mask_group = (adata.obs["sample"] == s) & (adata.obs["labels_joint_source"] == src)
-            if mask_group.sum() == 0:
-                continue
-            thresh = adata.obs.loc[mask_group, "n_genes_by_counts"].quantile(QUALITY_PERCENTILE / 100)
-            keep_1a.loc[mask_group] = (adata.obs.loc[mask_group, "n_genes_by_counts"] >= thresh).values
-            threshold_log.append({
-                "sample": s, "source": src, "n_genes_threshold": thresh,
-                "n_cells": mask_group.sum(), "n_kept": int(keep_1a.loc[mask_group].sum()),
-            })
+keep_1a = pd.Series(True, index=adata.obs_names, dtype=bool)
+threshold_log = []
+for s in samples:
+    for src in adata.obs["labels_joint_source"].unique():
+        mask_group = (adata.obs["sample"] == s) & (adata.obs["labels_joint_source"] == src)
+        if mask_group.sum() == 0:
+            continue
+        row = {"sample": s, "source": src, "n_cells": mask_group.sum()}
+        group_keep = pd.Series(True, index=adata.obs_names[mask_group])
+        for metric in FILTER_METRICS:
+            thresh = adata.obs.loc[mask_group, metric].quantile(QUALITY_PERCENTILE / 100)
+            group_keep &= (adata.obs.loc[mask_group, metric] >= thresh).values
+            row[f"{metric}_threshold"] = thresh
+        group_keep &= (adata.obs.loc[mask_group, "n_genes_by_counts"] >= MIN_GENES_FLOOR).values
+        keep_1a.loc[mask_group] = group_keep.values
+        row["n_kept"] = int(group_keep.sum())
+        threshold_log.append(row)
 
-    # keep_1a must stay boolean -- pandas can silently coerce it to
-    # object/int during mixed .loc assignment, which turns ~keep_1a into
-    # bitwise complement (-1/-2) instead of boolean negation and breaks
-    # every downstream .loc[~keep_1a, ...] call with a cryptic KeyError.
-    assert keep_1a.dtype == bool, f"keep_1a is not bool (got {keep_1a.dtype}) -- fix before proceeding"
+# keep_1a must stay boolean -- pandas can silently coerce it to
+# object/int during mixed .loc assignment, which turns ~keep_1a into
+# bitwise complement (-1/-2) instead of boolean negation and breaks
+# every downstream .loc[~keep_1a, ...] call with a cryptic KeyError.
+assert keep_1a.dtype == bool, f"keep_1a is not bool (got {keep_1a.dtype}) -- fix before proceeding"
 
-    threshold_df = pd.DataFrame(threshold_log)
-    print(threshold_df.to_string(index=False))
+threshold_df = pd.DataFrame(threshold_log)
+print(threshold_df.to_string(index=False))
+print(f"\nGroups where the {MIN_GENES_FLOOR}-gene floor is STRICTER than the group's own "
+      f"5th percentile (i.e. the floor is doing extra work beyond the quantile cut):")
+print(threshold_df[threshold_df["n_genes_by_counts_threshold"] < MIN_GENES_FLOOR]
+      [["sample", "source", "n_genes_by_counts_threshold"]].to_string(index=False))
 
-    n_before = adata.n_obs
-    print("\nCells lost per sample:")
-    print(adata.obs.loc[~keep_1a, "sample"].value_counts())
-    print("\n% lost per sample (should now be ~equal across samples, by construction):")
-    print((adata.obs.loc[~keep_1a, "sample"].value_counts() / adata.obs["sample"].value_counts() * 100).round(1))
+n_before = adata.n_obs
+print("\nCells lost per sample:")
+print(adata.obs.loc[~keep_1a, "sample"].value_counts())
+print("\n% lost per sample (won't be exactly ~5% -- AND of two quantile cuts + "
+      "the absolute floor drops more than 5% per group, since the tails don't "
+      "fully overlap):")
+print((adata.obs.loc[~keep_1a, "sample"].value_counts() / adata.obs["sample"].value_counts() * 100).round(1))
 
 # %% [markdown]
 # ## 1a-check. Does the filter disproportionately remove primary
 # (StarDist, immune/stromal) cells vs. secondary (Cellpose, muscle)?
 # Both populations are already merged into this object (qc_stardist_cell.py
-# Section 14, per the combined-segmentation decision in PROJECT_CONTEXT.md
-# Section 6) -- nothing here removes secondary, this only checks whether a
+# Section 14) -- nothing here removes secondary, this only checks whether a
 # single fixed threshold filters the two populations at very different
 # rates. Primary cells are naturally smaller/fewer counts by construction
 # (individual interstitial nuclei vs. whole myofibers) -- a single fixed
@@ -167,103 +232,80 @@ if not USE_CHECKPOINT:
 # touching the muscle compartment.
 
 # %%
-if not USE_CHECKPOINT:
-    print("QC distribution by labels_joint_source, BEFORE filtering:")
-    print(adata.obs.groupby("labels_joint_source")[["total_counts", "n_genes_by_counts"]].median())
+print("QC distribution by labels_joint_source, BEFORE filtering:")
+print(adata.obs.groupby("labels_joint_source")[["total_counts", "n_genes_by_counts"]].median())
 
-    print("\n% of each source category that would be LOST by the 1a filter:")
-    loss_by_source = (~keep_1a).groupby(adata.obs["labels_joint_source"]).mean() * 100
-    print(loss_by_source.round(1))
+print("\n% of each source category that would be LOST by the 1a filter:")
+loss_by_source = (~keep_1a).groupby(adata.obs["labels_joint_source"]).mean() * 100
+print(loss_by_source.round(1))
 
-    print("\nCounts lost/kept by source:")
-    print(pd.crosstab(adata.obs["labels_joint_source"], keep_1a, margins=True))
-    # If loss_by_source is strongly asymmetric (e.g. losing 40% of primary
-    # vs. 2% of secondary), the single fixed threshold below is not
-    # appropriate -- switch to source-specific thresholds instead, e.g.:
-    #
-    # keep_primary = (adata.obs["labels_joint_source"] == "primary") & \
-    #                (adata.obs["total_counts"] >= MIN_COUNTS_PRIMARY) & \
-    #                (adata.obs["n_genes_by_counts"] >= MIN_GENES_PRIMARY)
-    # keep_secondary = (adata.obs["labels_joint_source"] == "secondary") & \
-    #                   (adata.obs["total_counts"] >= MIN_COUNTS_SECONDARY) & \
-    #                   (adata.obs["n_genes_by_counts"] >= MIN_GENES_SECONDARY)
-    # keep_1a = keep_primary | keep_secondary
+print("\nCounts lost/kept by source:")
+print(pd.crosstab(adata.obs["labels_joint_source"], keep_1a, margins=True))
 
 # %% [markdown]
 # ## 1a-dist. Distributions by labels_joint_source — UMIs, genes, mito %
-# Confirmed: primary/secondary composition (0.71-0.85 primary across
-# samples) does NOT explain the sample-level loss asymmetry -- even within
-# primary alone, Control-GER lost 16.9% vs. Injured-1hrs 54.2% at the same
-# fixed cutoff. Before deciding on a per-sample relative threshold, look at
-# the actual shape of these distributions for each source.
 
 # %%
-if not USE_CHECKPOINT:
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    for ax, metric, title in zip(
-        axes,
-        ["total_counts", "n_genes_by_counts", "pct_counts_mt"],
-        ["Total counts per cell", "Genes detected per cell", "% mitochondrial counts per cell"],
-    ):
-        sns.violinplot(data=adata.obs, x="labels_joint_source", y=metric, ax=ax, cut=0, inner="quartile")
-        ax.set_title(title)
-        if metric != "pct_counts_mt":
-            ax.set_yscale("log")
-    plt.tight_layout()
-    plt.show()
+fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+for ax, metric, title in zip(
+    axes,
+    ["total_counts", "n_genes_by_counts", "pct_counts_mt"],
+    ["Total counts per cell", "Genes detected per cell", "% mitochondrial counts per cell"],
+):
+    sns.violinplot(data=adata.obs, x="labels_joint_source", y=metric, ax=ax, cut=0, inner="quartile")
+    ax.set_title(title)
+    if metric != "pct_counts_mt":
+        ax.set_yscale("log")
+plt.tight_layout()
+plt.show()
 
-    print(adata.obs.groupby("labels_joint_source")[["total_counts", "n_genes_by_counts", "pct_counts_mt"]].describe().T)
+print(adata.obs.groupby("labels_joint_source")[["total_counts", "n_genes_by_counts", "pct_counts_mt"]].describe().T)
 
-    # same, but split by sample too -- to see whether the primary/secondary
-    # shape itself differs between control and injured, or just shifts in depth
-    fig, axes = plt.subplots(3, 1, figsize=(18, 16))
-    for ax, metric, title in zip(
-        axes,
-        ["total_counts", "n_genes_by_counts", "pct_counts_mt"],
-        ["Total counts per cell", "Genes detected per cell", "% mitochondrial counts per cell"],
-    ):
-        sns.violinplot(data=adata.obs, x="sample", y=metric, hue="labels_joint_source", ax=ax, cut=0, inner="quartile", split=True)
-        ax.set_title(title)
-        ax.tick_params(axis="x", rotation=45)
-        if metric != "pct_counts_mt":
-            ax.set_yscale("log")
-    plt.tight_layout()
-    plt.show()
+fig, axes = plt.subplots(3, 1, figsize=(18, 16))
+for ax, metric, title in zip(
+    axes,
+    ["total_counts", "n_genes_by_counts", "pct_counts_mt"],
+    ["Total counts per cell", "Genes detected per cell", "% mitochondrial counts per cell"],
+):
+    sns.violinplot(data=adata.obs, x="sample", y=metric, hue="labels_joint_source", ax=ax, cut=0, inner="quartile", split=True)
+    ax.set_title(title)
+    ax.tick_params(axis="x", rotation=45)
+    if metric != "pct_counts_mt":
+        ax.set_yscale("log")
+plt.tight_layout()
+plt.show()
 
 # %%
-if not USE_CHECKPOINT:
-    adata_before_1a = adata  # keep a reference for the spatial plot in 1b, before subsetting
-    adata = adata[keep_1a].copy()
-    print(f"\nFiltered {n_before - adata.n_obs} cells ({(n_before - adata.n_obs)/n_before*100:.1f}%), {adata.n_obs} remain")
+adata_before_1a = adata  # keep a reference for the spatial plot in 1b, before subsetting
+adata = adata[keep_1a].copy()
+print(f"\nFiltered {n_before - adata.n_obs} cells ({(n_before - adata.n_obs)/n_before*100:.1f}%), {adata.n_obs} remain")
 
 # %% [markdown]
 # ## 1b. Spatial plot — which cells were lost to the 1a filter, per sample
 # Random scatter across the tissue = likely genuinely low-signal cells
 # (expected, safe to drop). Spatial clustering in one region = worth a
-# closer look before trusting the filter blindly (could be a real biology
-# signal with low RNA content, not just noise).
+# closer look before trusting the filter blindly.
 
 # %%
-if not USE_CHECKPOINT:
-    for s in samples:
-        a_s = adata_before_1a[adata_before_1a.obs["sample"] == s]
-        coords = a_s.obsm["spatial"]
-        lost = ~keep_1a[adata_before_1a.obs["sample"] == s].values
+for s in samples:
+    a_s = adata_before_1a[adata_before_1a.obs["sample"] == s]
+    coords = a_s.obsm["spatial"]
+    lost = ~keep_1a[adata_before_1a.obs["sample"] == s].values
 
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.scatter(coords[~lost, 0], coords[~lost, 1], c="lightgray", s=6, alpha=0.4, label="retained")
-        ax.scatter(coords[lost, 0], coords[lost, 1], c="#C0392B", s=10, alpha=0.85, label="lost (1a filter)")
-        ax.invert_yaxis()
-        ax.set_aspect("equal")
-        ax.axis("off")
-        n_lost = lost.sum()
-        n_total = len(lost)
-        ax.set_title(f"{s} ({n_lost}/{n_total} lost, {n_lost/n_total*100:.1f}%)")
-        ax.legend(markerscale=2, fontsize=8, loc="upper right")
-        plt.tight_layout()
-        plt.show()
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.scatter(coords[~lost, 0], coords[~lost, 1], c="lightgray", s=6, alpha=0.4, label="retained")
+    ax.scatter(coords[lost, 0], coords[lost, 1], c="#C0392B", s=10, alpha=0.85, label="lost (1a filter)")
+    ax.invert_yaxis()
+    ax.set_aspect("equal")
+    ax.axis("off")
+    n_lost = lost.sum()
+    n_total = len(lost)
+    ax.set_title(f"{s} ({n_lost}/{n_total} lost, {n_lost/n_total*100:.1f}%)")
+    ax.legend(markerscale=2, fontsize=8, loc="upper right")
+    plt.tight_layout()
+    plt.show()
 
-    del adata_before_1a  # free memory, not needed past this point
+del adata_before_1a  # free memory, not needed past this point
 
 # %% [markdown]
 # ## 2. Separate gene vs. TE features (SoloTE)
@@ -273,9 +315,8 @@ if not USE_CHECKPOINT:
 # which is much noisier than gene dropout).
 
 # %%
-if not USE_CHECKPOINT:
-    adata.var["is_te"] = adata.var_names.str.contains("SoloTE")
-    print("genes:", (~adata.var["is_te"]).sum(), "| TE features:", adata.var["is_te"].sum())
+adata.var["is_te"] = adata.var_names.str.contains("SoloTE")
+print("genes:", (~adata.var["is_te"]).sum(), "| TE features:", adata.var["is_te"].sum())
 
 # %% [markdown]
 # ## 3. Batch-aware HVG (seurat_v3, genes only, batch_key='sample')
@@ -284,98 +325,83 @@ if not USE_CHECKPOINT:
 # and combines the rankings -- important with 8 very different
 # samples/conditions (Control vs. Injured 1h...24h) so technical variance
 # between samples isn't mistaken for real biological variance.
-# Checked: 17,927 genes total (excl. TE), 2000 HVGs selected -- reasonable
-# given near-whole-transcriptome coverage.
 
 # %%
-if not USE_CHECKPOINT:
-    adata_genes = adata[:, ~adata.var["is_te"]].copy()
+adata_genes = adata[:, ~adata.var["is_te"]].copy()
 
-    sc.pp.highly_variable_genes(
-        adata_genes,
-        layer="counts",
-        n_top_genes=2000,
-        flavor="seurat_v3",
-        batch_key="sample",
-    )
-    sc.pl.highly_variable_genes(adata_genes)
+sc.pp.highly_variable_genes(
+    adata_genes,
+    layer="counts",
+    n_top_genes=2000,
+    flavor="seurat_v3",
+    batch_key="sample",
+)
+sc.pl.highly_variable_genes(adata_genes)
 
-    # Propagate the result to the full object (TEs are never HVGs)
-    for col in ["highly_variable", "highly_variable_rank", "means", "variances", "variances_norm"]:
-        adata.var[col] = np.nan if col != "highly_variable" else False
-        adata.var.loc[adata_genes.var_names, col] = adata_genes.var[col].values
-    adata.var["highly_variable"] = adata.var["highly_variable"].fillna(False).astype(bool)
+# Propagate the result to the full object (TEs are never HVGs)
+for col in ["highly_variable", "highly_variable_rank", "means", "variances", "variances_norm"]:
+    adata.var[col] = np.nan if col != "highly_variable" else False
+    adata.var.loc[adata_genes.var_names, col] = adata_genes.var[col].values
+adata.var["highly_variable"] = adata.var["highly_variable"].fillna(False).astype(bool)
 
-    print("HVGs selected:", adata.var["highly_variable"].sum())
+print("HVGs selected:", adata.var["highly_variable"].sum())
 
 # %% [markdown]
 # ## 4. PCA
 
 # %%
-if not USE_CHECKPOINT:
-    sc.pp.pca(adata, n_comps=50, use_highly_variable=True)
-    sc.pl.pca_variance_ratio(adata, n_pcs=50, log=True)
-    sc.pl.pca(adata, color=["sample", "condition_label"])
-    # PC1 was strongly dominant over the rest at first pass -- see Section
-    # 4a diagnostic below before trusting downstream neighbors/clustering.
+sc.pp.pca(adata, n_comps=50, use_highly_variable=True)
+sc.pl.pca_variance_ratio(adata, n_pcs=50, log=True)
+sc.pl.pca(adata, color=["sample", "condition_label"])
 
 # %% [markdown]
 # ## 4a-npcs. How many PCs to use for neighbors/Harmony — variance check
 # n_pcs controls how many of the 50 Harmony PCs go into the neighbor graph.
 # Too few loses real biological signal; too many adds noise from
-# low-variance PCs, which can worsen graph fragmentation (Section 6z/6a
-# showed the KNN graph splitting into dozens of disconnected components).
-# Note: PC1 is strongly dominant (Section 4a loadings below: mt-Nd1, Myh1,
-# Myl1, etc.) -- cumulative variance explained can look high with few PCs
-# just because of that one dominant axis, not because the rest of the
-# structure is well summarized. This is a first-pass heuristic only --
-# cross-checked empirically against connected_components in Section 5a,
-# after Harmony, since that's the actual problem being debugged.
+# low-variance PCs, which can worsen graph fragmentation. This is a
+# first-pass heuristic only -- cross-checked empirically against
+# connected_components in Section 5a, since that's the actual problem
+# being debugged.
 
 # %%
-if not USE_CHECKPOINT:
-    var_ratio = adata.uns["pca"]["variance_ratio"]
-    cum_var = np.cumsum(var_ratio)
+var_ratio = adata.uns["pca"]["variance_ratio"]
+cum_var = np.cumsum(var_ratio)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(range(1, len(cum_var) + 1), cum_var, marker="o", markersize=3)
-    ax.axhline(0.8, color="gray", linestyle="--", label="80%")
-    ax.axhline(0.9, color="gray", linestyle=":", label="90%")
-    ax.axvline(15, color="red", linestyle="--", label="candidate n_pcs=15")
-    ax.axvline(30, color="orange", linestyle="--", label="candidate n_pcs=30")
-    ax.set_xlabel("number of PCs")
-    ax.set_ylabel("cumulative variance explained")
-    ax.legend()
-    plt.show()
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.plot(range(1, len(cum_var) + 1), cum_var, marker="o", markersize=3)
+ax.axhline(0.8, color="gray", linestyle="--", label="80%")
+ax.axhline(0.9, color="gray", linestyle=":", label="90%")
+ax.axvline(15, color="red", linestyle="--", label="candidate n_pcs=15")
+ax.axvline(30, color="orange", linestyle="--", label="candidate n_pcs=30")
+ax.set_xlabel("number of PCs")
+ax.set_ylabel("cumulative variance explained")
+ax.legend()
+plt.show()
 
-    print(f"Variance explained by first 15 PCs: {cum_var[14]*100:.1f}%")
-    print(f"Variance explained by first 30 PCs: {cum_var[29]*100:.1f}%")
-    print(f"PCs needed for 80%: {np.searchsorted(cum_var, 0.8) + 1}")
-    print(f"PCs needed for 90%: {np.searchsorted(cum_var, 0.9) + 1}")
+print(f"Variance explained by first 15 PCs: {cum_var[14]*100:.1f}%")
+print(f"Variance explained by first 30 PCs: {cum_var[29]*100:.1f}%")
+print(f"PCs needed for 80%: {np.searchsorted(cum_var, 0.8) + 1}")
+print(f"PCs needed for 90%: {np.searchsorted(cum_var, 0.9) + 1}")
 
 # %% [markdown]
 # ## 4a. PCA outlier diagnostic — investigate the "ray" pattern
-# A small number of cells formed thin radiating lines in PC1/PC2, separate
-# from the main cloud. Traced to top-loading genes (mt-Nd1, Myl1, Myh4,
-# Actn3, Myh1 -- muscle/mitochondrial), then to raw counts: these are
-# low-complexity cells (median ~42 total counts, ~17 genes detected) where
+# Historically traced to top-loading genes (mt-Nd1, Myl1, Myh4, Actn3,
+# Myh1 -- muscle/mitochondrial) and low-complexity cells where
 # normalize_total() inflates whichever single transcript happens to
-# dominate the (very few) raw counts. Among these, 105/717 outlier cells
-# have a TE as their single dominant transcript (L1/Alu/B2 families),
-# strongly skewed toward Injured-12h/24h -- see Finding #10 investigation
-# below (Section 4b) for the raw-counts confirmation that this is real
-# signal, not purely a normalization artifact.
+# dominate the (very few) raw counts. Among these, a subset have a TE as
+# their single dominant transcript (L1/Alu/B2 families), strongly skewed
+# toward Injured-12h/24h -- see Finding #10 investigation below (Section
+# 4b).
 
 # %%
-if not USE_CHECKPOINT:
-    loadings = pd.DataFrame(
-        adata.varm["PCs"][:, :2], index=adata.var_names, columns=["PC1", "PC2"]
-    )
-    print(loadings.reindex(loadings["PC1"].abs().sort_values(ascending=False).index).head(15))
-    print(loadings.reindex(loadings["PC2"].abs().sort_values(ascending=False).index).head(15))
+loadings = pd.DataFrame(
+    adata.varm["PCs"][:, :2], index=adata.var_names, columns=["PC1", "PC2"]
+)
+print(loadings.reindex(loadings["PC1"].abs().sort_values(ascending=False).index).head(15))
+print(loadings.reindex(loadings["PC2"].abs().sort_values(ascending=False).index).head(15))
 
-    sc.pl.pca(adata, color=["total_counts", "pct_counts_mt", "n_genes_by_counts"], components=["1,2"])
-    sc.pl.pca(adata, color=["Myh1", "Myh4", "mt-Nd1", "Ldha"], components=["1,2"])
+sc.pl.pca(adata, color=["total_counts", "pct_counts_mt", "n_genes_by_counts"], components=["1,2"])
+sc.pl.pca(adata, color=["Myh1", "Myh4", "mt-Nd1", "Ldha"], components=["1,2"])
 
 # %% [markdown]
 # ## 4b. TE-dominant outlier cells — raw-counts confirmation (Finding #10)
@@ -385,61 +411,58 @@ if not USE_CHECKPOINT:
 # not a normalize_total() artifact.
 
 # %%
-if not USE_CHECKPOINT:
-    pc = adata.obsm["X_pca"][:, :2]
-    extreme_mask = pc[:, 0] < np.percentile(pc[:, 0], 1)  # adjust percentile to match where the rays sit
-    sub = adata[extreme_mask]
+pc = adata.obsm["X_pca"][:, :2]
+extreme_mask = pc[:, 0] < np.percentile(pc[:, 0], 1)  # adjust percentile to match where the rays sit
+sub = adata[extreme_mask]
 
-    raw = sub.layers["counts"]
-    top_gene_idx = np.asarray(raw.argmax(axis=1)).flatten()
-    top_genes = sub.var_names[top_gene_idx]
-    print(pd.Series(top_genes).value_counts().head(10))
+raw = sub.layers["counts"]
+top_gene_idx = np.asarray(raw.argmax(axis=1)).flatten()
+top_genes = sub.var_names[top_gene_idx]
+print(pd.Series(top_genes).value_counts().head(10))
 
-    te_dominant_mask = pd.Series(top_genes, index=sub.obs_names).str.contains("SoloTE")
-    te_dominant_cells = sub[te_dominant_mask.values]
-    print(te_dominant_cells.n_obs, "TE-dominant cells")
-    print(te_dominant_cells.obs["sample"].value_counts())
+te_dominant_mask = pd.Series(top_genes, index=sub.obs_names).str.contains("SoloTE")
+te_dominant_cells = sub[te_dominant_mask.values]
+print(te_dominant_cells.n_obs, "TE-dominant cells")
+print(te_dominant_cells.obs["sample"].value_counts())
 
-    adata.obs["te_dominant_outlier"] = False
-    adata.obs.loc[te_dominant_cells.obs_names, "te_dominant_outlier"] = True
+adata.obs["te_dominant_outlier"] = False
+adata.obs.loc[te_dominant_cells.obs_names, "te_dominant_outlier"] = True
 
-    # Raw TE_fraction check (Section 11 of the QC notebook: raw TE-UMIs /
-    # raw total-UMIs, computed pre-normalization -- not affected by the
-    # normalize_total() inflation on low-count cells)
-    sub_12h = adata[adata.obs["sample"] == "Injured-12hrs"]
-    is_te_dom_12h = sub_12h.obs_names.isin(te_dominant_cells.obs_names)
-    print("TE-dominant (raw TE_fraction):")
-    print(sub_12h.obs.loc[is_te_dom_12h, "TE_fraction"].describe())
-    print("\nRest of Injured-12hrs (raw TE_fraction):")
-    print(sub_12h.obs.loc[~is_te_dom_12h, "TE_fraction"].describe())
-    # Result found: median 15.4% vs. 6.4% (2.4x) on RAW counts -- confirms
-    # real signal, not a normalization artifact. Still open: raw-counts
-    # specificity check (is a TE dominant among low-complexity cells more
-    # often than chance, vs. a normal gene being dominant) to distinguish
-    # "real localized TE reactivation" from "generic RNA degradation in
-    # damaged/necrotic cells that happens to hit TEs". H&E cross-check for
-    # spatial correlation with the lesion site also still pending.
+# Raw TE_fraction check (Section 11 of the QC notebook: raw TE-UMIs /
+# raw total-UMIs, computed pre-normalization -- not affected by the
+# normalize_total() inflation on low-count cells)
+sub_12h = adata[adata.obs["sample"] == "Injured-12hrs"]
+is_te_dom_12h = sub_12h.obs_names.isin(te_dominant_cells.obs_names)
+print("TE-dominant (raw TE_fraction):")
+print(sub_12h.obs.loc[is_te_dom_12h, "TE_fraction"].describe())
+print("\nRest of Injured-12hrs (raw TE_fraction):")
+print(sub_12h.obs.loc[~is_te_dom_12h, "TE_fraction"].describe())
+# Still open: raw-counts specificity check (is a TE dominant among
+# low-complexity cells more often than chance, vs. a normal gene being
+# dominant) to distinguish "real localized TE reactivation" from "generic
+# RNA degradation in damaged/necrotic cells that happens to hit TEs". H&E
+# cross-check for spatial correlation with the lesion site also pending.
 
-    # Spatial visualization (raw TE_fraction, top decile highlighted for contrast)
-    coords = sub_12h.obsm["spatial"]
-    te_frac = sub_12h.obs["TE_fraction"].values * 100
-    threshold = np.percentile(te_frac, 90)
-    is_high = te_frac >= threshold
+# Spatial visualization (raw TE_fraction, top decile highlighted for contrast)
+coords = sub_12h.obsm["spatial"]
+te_frac = sub_12h.obs["TE_fraction"].values * 100
+threshold = np.percentile(te_frac, 90)
+is_high = te_frac >= threshold
 
-    fig, ax = plt.subplots(figsize=(8, 8))
-    ax.scatter(coords[~is_high, 0], coords[~is_high, 1], c="lightgray", s=6, alpha=0.4)
-    sca = ax.scatter(coords[is_high, 0], coords[is_high, 1], c=te_frac[is_high],
-                      cmap="viridis_r", s=20, alpha=1.0, vmin=threshold, vmax=te_frac.max())
-    plt.colorbar(sca, ax=ax, shrink=0.6, label="% UMIs from TE (top 10%, raw)")
-    ax.scatter(coords[is_te_dom_12h, 0], coords[is_te_dom_12h, 1],
-               facecolors="none", edgecolors="red", s=60, linewidths=1.5, label="TE-dominant outlier")
-    ax.invert_yaxis()
-    ax.set_aspect("equal")
-    ax.axis("off")
-    ax.legend(markerscale=1, fontsize=8)
-    ax.set_title("Injured-12hrs — top 10% raw TE fraction + TE-dominant outliers (red)")
-    plt.tight_layout()
-    plt.show()
+fig, ax = plt.subplots(figsize=(8, 8))
+ax.scatter(coords[~is_high, 0], coords[~is_high, 1], c="lightgray", s=6, alpha=0.4)
+sca = ax.scatter(coords[is_high, 0], coords[is_high, 1], c=te_frac[is_high],
+                  cmap="viridis_r", s=20, alpha=1.0, vmin=threshold, vmax=te_frac.max())
+plt.colorbar(sca, ax=ax, shrink=0.6, label="% UMIs from TE (top 10%, raw)")
+ax.scatter(coords[is_te_dom_12h, 0], coords[is_te_dom_12h, 1],
+           facecolors="none", edgecolors="red", s=60, linewidths=1.5, label="TE-dominant outlier")
+ax.invert_yaxis()
+ax.set_aspect("equal")
+ax.axis("off")
+ax.legend(markerscale=1, fontsize=8)
+ax.set_title("Injured-12hrs — top 10% raw TE fraction + TE-dominant outliers (red)")
+plt.tight_layout()
+plt.show()
 
 # %% [markdown]
 # ## 5. Batch integration — Harmony
@@ -459,52 +482,50 @@ if not USE_CHECKPOINT:
 # Calling harmonypy directly avoids the bug.
 
 # %%
-if not USE_CHECKPOINT:
-    data_mat = adata.obsm["X_pca"]
-    print(data_mat.shape)  # should be (n_cells, 50)
+data_mat = adata.obsm["X_pca"]
+print(data_mat.shape)  # should be (n_cells, 50)
 
-    ho = hm.run_harmony(data_mat, adata.obs, "sample", verbose=True)
+ho = hm.run_harmony(data_mat, adata.obs, "sample", verbose=True)
 
-    # harmonypy>=0.1.0 (incl. 2.0.0 here) returns Z_corr already as
-    # (n_obs, n_pcs) -- do NOT transpose. Verify shape before trusting it.
-    print(ho.Z_corr.shape)  # should be (n_cells, 50)
-    adata.obsm["X_pca_harmony"] = ho.Z_corr
+# harmonypy>=0.1.0 (incl. 2.0.0 here) returns Z_corr already as
+# (n_obs, n_pcs) -- do NOT transpose. Verify shape before trusting it.
+print(ho.Z_corr.shape)  # should be (n_cells, 50)
+adata.obsm["X_pca_harmony"] = ho.Z_corr
 
 # %% [markdown]
 # ## 5a. Empirical check — which n_pcs gives the healthiest neighbor graph?
-# More directly relevant than the variance-explained heuristic in 4a-npcs,
-# given we're actively debugging graph fragmentation (Section 6z/6a showed
-# dozens of disconnected KNN-graph components regardless of Leiden
-# resolution). Recomputes neighbors at several n_pcs values and counts
-# connected components for each -- expensive (recomputes neighbors N
-# times), but gives a direct empirical answer instead of a variance-based
-# guess. Uses n_neighbors=30 (raised from an initial 15, which produced
-# ~94 disconnected components pre-filter / dozens post-filter -- isolated
-# low-signal cells only found each other as mutual neighbors at k=15).
+# More directly relevant than the variance-explained heuristic in 4a-npcs.
+# Recomputes neighbors at several n_pcs values and counts connected
+# components for each -- expensive (recomputes neighbors N times), but
+# gives a direct empirical answer instead of a variance-based guess.
+#
+# Empirically confirmed on the two-metric-quantile + MIN_GENES_FLOOR=20
+# filter (Section 1a): n_pcs=15/20/30/50 all gave exactly 1 connected
+# component (down from 23-32 pre-floor) -- the graph fragmentation problem
+# is resolved. Confirmed twice, with and without the (since-reverted)
+# regress_out step -- same result either way, so this number doesn't
+# depend on that decision.
 
 # %%
-if not USE_CHECKPOINT:
-    from scipy.sparse.csgraph import connected_components  # local import, in case the top imports cell wasn't re-run this session
+from scipy.sparse.csgraph import connected_components  # local import, in case the top imports cell wasn't re-run this session
 
-    npcs_component_counts = {}
-    for n_pcs_test in [15, 20, 30, 50]:
-        sc.pp.neighbors(adata, use_rep="X_pca_harmony", n_neighbors=30, n_pcs=n_pcs_test, key_added=f"test_pcs{n_pcs_test}")
-        n_comp, _ = connected_components(adata.obsp[f"test_pcs{n_pcs_test}_connectivities"], directed=False)
-        npcs_component_counts[n_pcs_test] = n_comp
-        print(f"n_pcs={n_pcs_test}: {n_comp} connected components")
-    # Pick the n_pcs value with the fewest connected components (ideally 1,
-    # or close to it) and use it in Section 6 below -- update
-    # FINAL_N_PCS accordingly instead of leaving it at a guessed default.
-    FINAL_N_PCS = min(npcs_component_counts, key=npcs_component_counts.get)
-    print(f"\nChosen n_pcs based on connectivity: {FINAL_N_PCS}")
+npcs_component_counts = {}
+for n_pcs_test in [15, 20, 30, 50]:
+    sc.pp.neighbors(adata, use_rep="X_pca_harmony", n_neighbors=30, n_pcs=n_pcs_test, key_added=f"test_pcs{n_pcs_test}")
+    n_comp, _ = connected_components(adata.obsp[f"test_pcs{n_pcs_test}_connectivities"], directed=False)
+    npcs_component_counts[n_pcs_test] = n_comp
+    print(f"n_pcs={n_pcs_test}: {n_comp} connected components")
+# Pick the n_pcs value with the fewest connected components (ideally 1,
+# or close to it) and use it in Section 6 below.
+FINAL_N_PCS = min(npcs_component_counts, key=npcs_component_counts.get)
+print(f"\nChosen n_pcs based on connectivity: {FINAL_N_PCS}")
 
 # %% [markdown]
 # ## 6. Neighbors, UMAP and Leiden resolution sweep (on Harmony-corrected space)
 
 # %%
-if not USE_CHECKPOINT:
-    sc.pp.neighbors(adata, use_rep="X_pca_harmony", n_neighbors=30, n_pcs=FINAL_N_PCS)
-    sc.tl.umap(adata)
+sc.pp.neighbors(adata, use_rep="X_pca_harmony", n_neighbors=30, n_pcs=FINAL_N_PCS)
+sc.tl.umap(adata)
 
 # %% [markdown]
 # ## 6a. Resolution sweep — how many clusters "make sense"?
@@ -518,7 +539,7 @@ resolutions = [0.1, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5]
 # Clear any stale cluster columns from a previous run with different
 # neighbors/objective_function settings -- otherwise the `if key not in
 # adata.obs.columns` guard below silently skips recomputation and prints
-# old results (this bit us once already during debugging).
+# old results.
 for res in resolutions:
     key = f"clusters_r{res}"
     if key in adata.obs.columns:
@@ -574,7 +595,13 @@ for res in resolutions:
     print(f"res={res}: silhouette={score:.3f}")
 # Higher = more compact, better-separated clusters -- not the only metric
 # that matters; a low silhouette on a genuine biological continuum (e.g. a
-# differentiation trajectory) is expected and not necessarily a problem.
+# differentiation trajectory, cf. Finding #20 -- fiber-type continuum) is
+# expected and not necessarily a problem. Confirmed twice (post
+# 2-metric-quantile filter), with and without the since-reverted
+# regress_out step: silhouette stayed low across the board both times
+# (-0.03 to 0.02, no sharp peak, nearly identical numbers either way) --
+# consistent with continuum biology, and confirms the regress_out
+# question doesn't affect this metric one way or the other.
 
 # %% [markdown]
 # ## 6d. Do samples mix well within each cluster? (post-Harmony)
@@ -585,7 +612,12 @@ for res in resolutions:
 # this way, not be forced to mix).
 
 # %%
-RES_TO_CHECK = 0.5  # adjust based on 6a-6c
+RES_TO_CHECK = 0.2  # last chosen value: gave a large drop in tiny/
+# single-sample clusters vs. higher resolutions (only 3-6 clusters <50
+# cells, down from ~42 pre-floor) with almost the same structure as
+# res=0.3 at 7 fewer clusters, AND the worst (most negative) silhouette of
+# the whole sweep at res=0.1 -- re-confirm against 6a-6c on this run before
+# trusting it again.
 
 sample_props = pd.crosstab(adata.obs[f"clusters_r{RES_TO_CHECK}"], adata.obs["sample"], normalize="index")
 max_sample_frac = sample_props.max(axis=1)
@@ -609,6 +641,16 @@ print(summary[summary["max_sample_frac"] > 0.7])
 # %%
 sc.pl.umap(adata, color=[f"clusters_r{RES_TO_CHECK}", "sample", "condition_label"], ncols=1)
 
+# Depth/QC diagnostic -- check this every time the filter changes. Shows a
+# dense high-depth blob plus uniformly-low-depth "rays" radiating
+# outward -- a real sequencing-depth effect on the embedding, confirmed
+# via a regress_out experiment (since reverted, see the change-log note
+# above): it didn't move silhouette or any downstream clustering metric,
+# so it's read as mostly a 2D-projection/visual effect, not something
+# distorting the actual cluster structure Leiden works on. Worth
+# rechecking here each run in case that changes.
+sc.pl.umap(adata, color=["n_genes_by_counts", "total_counts", "pct_counts_mt"], cmap="viridis", ncols=3)
+
 fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 for ax, rep, title in zip(axes, ["X_pca", "X_pca_harmony"], ["PCA (uncorrected)", "PCA + Harmony"]):
     coords = adata.obsm[rep][:, :2]
@@ -625,7 +667,9 @@ plt.show()
 # %% [markdown]
 # ## 6f. Marker separation — does each cluster have a clear identity?
 # Well-defined clusters should have marker genes with high logFC, expressed
-# in a high % of their own cells and low % elsewhere.
+# in a high % of their own cells and low % elsewhere. Use this output to
+# fill NO_MARKER_CLUSTERS in Section 6g below -- cluster IDs are re-derived
+# every run, don't reuse IDs from a previous session's notes.
 
 # %%
 sc.tl.rank_genes_groups(adata, f"clusters_r{RES_TO_CHECK}", method="t-test")
@@ -651,47 +695,70 @@ print(marker_df)
 sc.pl.rank_genes_groups_dotplot(adata, n_genes=3, groupby=f"clusters_r{RES_TO_CHECK}")
 
 # %% [markdown]
-# ## 6g. Finalize clusters + checkpoint
+# ## 6g. Finalize clusters
 # Cross-reference 6a-6f: prefer the resolution where silhouette is
 # reasonable, clusters are stable across neighboring resolutions, and each
-# has real marker-driven identity (not just one-sample noise). Silhouette
-# improved steadily up to res=0.8 (-0.017) and flattened/slightly worsened
-# beyond that -- 0.5-0.8 are the reasonable candidates.
+# has real marker-driven identity (not just one-sample noise).
 #
-# Tiny, single-sample clusters (8-47 cells, ~40-47 of them, entropy_norm
-# near 0) persisted across every resolution tested and were investigated
-# as a possible single-gene-dominance artifact (top_gene_frac) -- ruled
-# out, no bimodal tail in that distribution. Most likely explanation:
-# residual low-quality cells that the Section 1a filter (5th percentile
-# per sample x source group) didn't fully remove -- expected residue after
-# any reasonable QC filter, not something to chase further upstream.
-# Handled here post-hoc instead: any cluster below MIN_CLUSTER_SIZE is
-# relabeled "low_confidence" rather than treated as a real cell type.
+# Two independent reasons to fold a cluster into `low_confidence`, not just
+# one:
+#   1. Too few cells (MIN_CLUSTER_SIZE) -- statistically unreliable
+#      regardless of marker quality.
+#   2. No clean marker in the 6f dotplot (NO_MARKER_CLUSTERS) -- even if
+#      large enough by cell count, a cluster with no gene reaching a
+#      decent fraction/expression anywhere isn't a real identity to name.
+#      Fill this in BY HAND after reading 6f's dotplot on this run -- IDs
+#      are not stable across reruns of the resolution sweep.
 #
 # Check where the Finding #10 TE-dominant population lands after this --
 # it should survive as its own reasonably-sized cluster, not fall into
 # low_confidence, confirming it's real signal and not part of this noise.
 
 # %%
-FINAL_RESOLUTION = 0.5  # <- set based on the checks above
-MIN_CLUSTER_SIZE = 50
+FINAL_RESOLUTION = 0.2  # <- set based on the checks above
+MIN_CLUSTER_SIZE = 20   # lowered from 50: post-filter, far fewer tiny clusters
+                        # remain, and the ones that do are worth a marker-based
+                        # look before assuming they're noise (cf. the TE-dominant
+                        # cluster, which stayed small but stable across res=0.1-0.3)
+NO_MARKER_CLUSTERS = []  # <- fill in by hand from Section 6f's dotplot on THIS run,
+                          # e.g. clusters with an all-blank row (no gene with
+                          # decent fraction/expression anywhere)
 
 sizes = adata.obs[f"clusters_r{FINAL_RESOLUTION}"].value_counts()
 tiny_clusters = sizes[sizes < MIN_CLUSTER_SIZE].index
 
 adata.obs["clusters"] = adata.obs[f"clusters_r{FINAL_RESOLUTION}"].astype(str)
 adata.obs.loc[adata.obs["clusters"].isin(tiny_clusters), "clusters"] = "low_confidence"
+adata.obs.loc[adata.obs["clusters"].isin(NO_MARKER_CLUSTERS), "clusters"] = "low_confidence"
 adata.obs["clusters"] = adata.obs["clusters"].astype("category")
 
 print(adata.obs["clusters"].value_counts())
-print(f"\n{len(tiny_clusters)} tiny clusters merged into 'low_confidence' "
-      f"({(adata.obs['clusters'] == 'low_confidence').sum()} cells total)")
+print(f"\n{(adata.obs['clusters'] == 'low_confidence').sum()} cells in low_confidence total "
+      f"({len(tiny_clusters)} tiny clusters by size, {len(NO_MARKER_CLUSTERS)} by no-marker)")
 
 print("\nWhere did the Finding #10 TE-dominant cells land?")
 print(adata.obs.loc[adata.obs["te_dominant_outlier"], "clusters"].value_counts())
 
-adata.write(CHECKPOINT)
-print("Checkpoint saved:", CHECKPOINT)
+# %% [markdown]
+# ## 6h. Drop low_confidence + recompute neighbors/UMAP
+# The saved embedding shouldn't still be shaped by cells that are excluded
+# from annotation. Neighbors must be recomputed (not just UMAP) -- removing
+# cells invalidates parts of the existing KNN graph, cells that had one of
+# the dropped cells as a neighbor need new graph edges.
+
+# %%
+n_before_drop = adata.n_obs
+adata = adata[adata.obs["clusters"] != "low_confidence"].copy()
+adata.obs["clusters"] = adata.obs["clusters"].cat.remove_unused_categories()
+print(f"Dropped low_confidence: {n_before_drop} -> {adata.n_obs} cells")
+
+sc.pp.neighbors(adata, use_rep="X_pca_harmony", n_neighbors=30, n_pcs=FINAL_N_PCS)
+sc.tl.umap(adata)
+
+sc.pl.umap(adata, color=["clusters", "sample", "condition_label"], ncols=1)
+# Sanity check: dropping low_confidence and recomputing shouldn't visibly
+# distort the rest of the structure -- if it does, MIN_CLUSTER_SIZE/
+# NO_MARKER_CLUSTERS above may have been too aggressive.
 
 # %% [markdown]
 # ## 7. Spatial plot per sample, colored by cluster
@@ -712,80 +779,10 @@ for s in samples:
     plt.show()
 
 # %% [markdown]
-# ## 8. Annotation — Level B
-# Cross-reference the per-cell `final_call` (Level A, Section 13 of the QC
-# notebook) aggregated by Leiden cluster, and confirm with sc.tl.score_genes
-# per panel -- this is what was left open in PROJECT_CONTEXT.md Section 7.
-#
-# Marker panel expanded from the original 6-type set (PMC12938030-derived)
-# to 29 cell types, sourced from two reference atlases whose experimental
-# design matches ours (aging x injury timecourse) — see PROJECT_CONTEXT.md
-# Section 6 for full citations:
-#   - bioRxiv 2023.05.25.542370 (mouse hindlimb notexin-injury atlas,
-#     3 age groups, 6 injury timepoints, Harmony-integrated) — Suppl.
-#     Fig. 3 canonical markers for 17 immune, 5 FAP/tenocyte/neural, and
-#     7 myogenic/pericyte/endothelial clusters.
-#   - Nat Commun Biol 4:1280 (2021), doi:10.1038/s42003-021-02810-x
-#     (111-sample sc/snRNA-seq compendium) — corroborating FAP/
-#     endothelial/myeloid subtype markers.
-
-# %%
-crosstab = pd.crosstab(adata.obs["clusters"], adata.obs["final_call"], normalize="index")
-print(crosstab.round(2))
-
-panels = {
-    # --- Immune (17 clusters in the reference) ---
-    "neutrophil":         ["S100a8", "S100a9", "Ly6g", "Mpo"],
-    "monocyte_patrol":    ["Ccr2"],
-    "macro_Mrc1":         ["Mrc1", "Cd163"],
-    "macro_Cx3cr1":       ["Cx3cr1"],
-    "macro_Cxcl10":       ["Cxcl10"],
-    "macro_general":      ["Cd68", "Csf1r", "Adgre1", "Itgam"],
-    "dendritic":          ["Cd209a", "Xcr1", "Fscn1", "Cd72", "H2-Ab1"],
-    "T_cell":             ["Cd3e", "Cd8a", "Cd8b1", "Cd4"],
-    "T_cell_cycling":     ["Cdk1", "Hmgb2"],
-    "NK_cell":            ["Nkg7", "Gzma", "Klra4", "Klre1"],
-    "B_cell":             ["Cd19", "Cd22", "Ms4a1"],
-    "erythrocyte":        ["Hba-a1", "Hba-a2", "Hbb-bs", "Hbb-bt"],  # not a native tissue cell type
-
-    # --- FAPs / Tenocytes / Neural (5 clusters) ---
-    "FAP_general":        ["Pdgfra", "Col3a1", "Ly6a", "Dcn"],
-    "FAP_adipogenic":     ["Adam12", "Bmp5", "Myoc", "Col1a1", "Mmp2", "Apod"],
-    "FAP_pro_remodeling": ["Tnfaip6", "Il33", "Bgn"],
-    "FAP_stem":           ["Igfbp5", "Dpp4", "Cd34", "Gsn"],
-    "tenocyte":           ["Tnmd", "Scx", "Col1a1", "Dcn"],
-    "schwann_neural":     ["Ptn", "Mpz"],
-
-    # --- Myogenic / vascular (7 clusters) ---
-    "satellite":          ["Pax7", "Myf5", "Myod1", "Cdh15"],
-    "myonuclei":          ["Myh1", "Myh2", "Acta1", "Ttn", "Des", "Myh4"],
-    "pericyte_SMC":       ["Rgs5", "Acta2", "Myl9", "Myh11"],
-    "endothelial_general":["Cdh5", "Pecam1"],
-    "endo_arterial":      ["Alpl", "Hey1"],
-    "endo_capillary":     ["Lpl"],
-    "endo_venous":        ["Vwf", "Icam1", "Lrg1", "Aplnr"],
-}
-
-for name, genes in panels.items():
-    genes_present = [g for g in genes if g in adata.var_names]
-    if not genes_present:
-        print(f"[warning] no genes from '{name}' found in adata.var_names -- skipping")
-        continue
-    sc.tl.score_genes(adata, genes_present, score_name=f"score_{name}")
-
-score_cols = [f"score_{n}" for n in panels if f"score_{n}" in adata.obs.columns]
-sc.pl.umap(adata, color=score_cols, ncols=4, cmap="viridis")
-print(adata.obs.groupby("clusters")[score_cols].mean().round(2))
-
-# %% [markdown]
-# ## 9. De novo markers per cluster (t-test)
-
-# %%
-sc.tl.rank_genes_groups(adata, "clusters", method="t-test")
-sc.pl.rank_genes_groups_dotplot(adata, n_genes=5)
-
-# %% [markdown]
-# ## 10. Save final clustered + annotated object
+# ## 8. Save final clustered object
+# Annotation (marker panels, DE, cluster naming) happens separately in
+# `cell_type_annotation.py` -- not duplicated here.
 
 # %%
 adata.write("/ibex/user/medinils/data/objects/all_samples_family_stardist_cell_clustered.h5ad")
+print("Saved:", adata)
