@@ -35,3 +35,5 @@ err.*.err
 outputs/
 session/
 *.html
+PROJECT_CONTEXT.md
+notebooks/*_figs/
