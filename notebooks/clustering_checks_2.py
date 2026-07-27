@@ -1,24 +1,46 @@
 # %% [markdown]
 # # Clustering checks, part 2 — fiber type, mast cells, high-mito markers,
-# # TE-dominant fix, TE_L1/L2 split, TE-only exploratory clustering
+# # TE-dominant cells, TE_L1/L2 split, TE-only exploratory clustering
 #
-# Continuation of `clustering_checks.py`. Reads the same checkpoint (now
-# with `clusters` + the Section 8 `score_*` columns already in `.obs`) and
-# works through the 5 items flagged in the last review round:
+# Continuation of `clustering_checks.py`. Reads the same checkpoint and
+# works through: high-mito cluster markers, mast-cell + fiber-type panels,
+# the TE-dominant cells (Finding #10), TE_L1/L2 fraction split, and TE-only
+# exploratory clustering.
 #
-#   1. rank_genes_groups on the 6 high-mito clusters — fiber-type genes?
-#   2. Mast cell panel (score_genes) — absent from the original 29-panel set
-#   3. Fiber-type panel (I/IIA/IIX/IIB) — applied broadly + to cluster 7
-#   4. Fix the 96-vs-11,108 TE-dominant-cell mismatch (config fix below)
-#   5. TE_L1 / TE_L2 fractions separately, not just the combined TE_fraction
-#   6. TE-only exploratory clustering (no genes, no Harmony) — hidden
-#      TE-driven substructure the gene-based clustering wouldn't catch
+# ## Updated against the reconstructed `clustering.py` (Finding #24)
+# - **Removed the 44-cluster-era hardcoded lists** (`HIGH_MITO_CLUSTERS`,
+#   `RESIDUAL_CLUSTERS`, `TE_DOMINANT_CLUSTERS=["12","46"]`, `CLUSTER_7`).
+#   Section 0 below derives high-mito/TE-dominant clusters automatically
+#   from the object, same approach as `clustering_checks.py`. `CLUSTER_7`
+#   (the old fiber-type-continuum candidate) is now a manual fill-in --
+#   there's no automatic way to detect "sits between two fiber types",
+#   that's a visual call from the UMAP/dotplot.
+# - **`RESIDUAL_CLUSTERS` retired as a concept** -- `clustering.py`
+#   Section 6g now handles that tier directly (`MIN_CLUSTER_SIZE` +
+#   `NO_MARKER_CLUSTERS`) before this script ever runs. Nothing here
+#   should reference it.
+# - **Fixed the Finding #23 bug in Section 6** (TE-only clustering):
+#   `sc.pp.pca(adata_te, ...)` was missing `use_highly_variable=False` --
+#   `adata_te` inherits `highly_variable=False` on every TE feature from
+#   the parent object (TEs are never HVGs, clustering.py Section 2), so
+#   PCA's default `use_highly_variable=True` filtered the matrix to 0
+#   columns and crashed with `ValueError: Found array with 0 feature(s)`.
+#   This is exactly the bug PROJECT_CONTEXT.md Finding #23 documented as
+#   "fix drafted, not yet confirmed run" -- it was never actually applied
+#   in this script until now.
+# - **Section 4's "~96 cells" reference check removed.** That number was
+#   from the pre-reconstruction 44-cluster object; the reconstructed
+#   pipeline gives a different (and not yet fixed) count each run --
+#   see PROJECT_CONTEXT.md Finding #24 (212/241 cells in one test run).
+#   Section 4 now just reports whatever count it finds, no hardcoded
+#   expectation to compare against.
 #
-# Same caveat as before: untested against the real object. Config below is
-# my best guess from what's been confirmed in chat; adjust and re-run.
+# Same caveat as before: untested against the real object. CONFIG below is
+# best-guess from what's been confirmed in chat; adjust and re-run.
 
 # %%
 import warnings
+import os
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -31,7 +53,6 @@ plt.rcParams["figure.dpi"] = 110
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 OUTDIR = "clustering_checks_figs"
-import os
 os.makedirs(OUTDIR, exist_ok=True)
 
 def savefig(name):
@@ -52,23 +73,33 @@ SAMPLE_COL = "sample"
 SPATIAL_KEY = "spatial"
 UMAP_KEY = "X_umap"
 
-# Confirmed from the last Load section output — this fixes the 96-vs-11,108
-# mismatch IF this column really is Finding #10's original flag.
-TE_DOMINANT_COL = "te_dominant_outlier"
+TE_DOMINANT_COL = "te_dominant_outlier"  # from clustering.py Section 4b (Finding #10)
 
 # TE features are identified as `"SoloTE" in var_name` (qc_stardist_cell.py
-# Section 2). Family-level names live inside that string, e.g. something
-# like "SoloTE_L1" / "SoloTE_L2" / "SoloTE_Alu" — CONFIRM the exact pattern
-# by checking the printed examples in the first cell below before trusting
-# the L1/L2 split.
+# Section 2 / clustering.py Section 2). Family-level names live inside that
+# string, e.g. "SoloTE|L1" / "SoloTE|L2" / "SoloTE|Alu" (per Finding #24's
+# 6f dotplot, the real separator is "|", not "_" -- confirm against the
+# printed examples below before trusting the L1/L2 split).
 TE_VAR_FLAG_COL = "is_te"
 L1_PATTERN = "L1"
 L2_PATTERN = "L2"
 
-HIGH_MITO_CLUSTERS = ["35", "36", "24", "28", "2", "25"]
-RESIDUAL_CLUSTERS = ["57", "63", "61", "60", "58", "64", "48", "65", "59", "62"]
-TE_DOMINANT_CLUSTERS = ["12", "46"]
-CLUSTER_7 = ["7"]
+# Automatic derivation thresholds, same as clustering_checks.py Section 0.
+HIGH_MITO_PCT_THRESHOLD = 20
+TE_DOMINANT_MIN_FRACTION = 0.05
+
+# Manual fill-ins -- no automatic way to derive these, they're visual/
+# biological judgment calls from the dotplot and UMAP neighbors.
+MANUAL_HIGH_MITO_CLUSTERS = []
+MANUAL_TE_DOMINANT_CLUSTERS = []
+CLUSTER_7_EQUIVALENT = []  # fill in the cluster(s) that look like they sit
+# in the middle of the fiber-type continuum (no significant marker despite
+# reasonable size) -- was hardcoded "7" in the 44-cluster era, not stable
+# across reruns. Check clustering.py Section 6f's padj column for
+# candidates (non-significant top_padj, decent n_cells) before filling.
+UMAP_NEIGHBOR_CANDIDATES = []  # fill in a few clusters near
+# CLUSTER_7_EQUIVALENT on the UMAP, for the continuum comparison in
+# Section 3 below -- look at the UMAP plot, not derivable automatically.
 
 # %% [markdown]
 # ## Load
@@ -88,6 +119,47 @@ print(f"\nExample TE feature names ({adata.var[TE_VAR_FLAG_COL].sum()} total):")
 print(te_examples)
 print("\n^ if these don't contain recognizable 'L1'/'L2' substrings, fix "
       "L1_PATTERN/L2_PATTERN in the CONFIG cell before running Section 5 below.")
+
+if "low_confidence" in adata.obs[CLUSTER_COL].unique():
+    print("\n[NOTE] 'low_confidence' present in this checkpoint -- clustering.py "
+          "Section 6h should have dropped it before saving. Confirm this checkpoint "
+          "is current before trusting the rest of this script.")
+
+# %% [markdown]
+# ## 0. Derive high-mito / TE-dominant cluster groups automatically
+# Same logic as `clustering_checks.py` Section 0 -- repeated here so this
+# script runs standalone. Recomputed fresh every run.
+
+# %%
+mito_by_cluster = adata.obs.groupby(CLUSTER_COL, observed=True)[MT_COL].median().sort_values(ascending=False)
+print("Median pct_counts_mt by cluster (top 10):")
+print(mito_by_cluster.head(10))
+
+HIGH_MITO_CLUSTERS = sorted(set(
+    mito_by_cluster[mito_by_cluster > HIGH_MITO_PCT_THRESHOLD].index.tolist()
+) | set(MANUAL_HIGH_MITO_CLUSTERS))
+print(f"\nHIGH_MITO_CLUSTERS (median %mt > {HIGH_MITO_PCT_THRESHOLD}): {HIGH_MITO_CLUSTERS}")
+
+if TE_DOMINANT_COL in adata.obs.columns:
+    n_te_dom_total = adata.obs[TE_DOMINANT_COL].astype(bool).sum()
+    te_dom_by_cluster = adata.obs.loc[adata.obs[TE_DOMINANT_COL].astype(bool), CLUSTER_COL].value_counts()
+    print(f"\n{n_te_dom_total} te_dominant_outlier cells total, by cluster:")
+    print(te_dom_by_cluster)
+    TE_DOMINANT_CLUSTERS = sorted(set(
+        te_dom_by_cluster[te_dom_by_cluster / max(n_te_dom_total, 1) >= TE_DOMINANT_MIN_FRACTION].index.tolist()
+    ) | set(MANUAL_TE_DOMINANT_CLUSTERS))
+    print(f"TE_DOMINANT_CLUSTERS (>= {TE_DOMINANT_MIN_FRACTION*100:.0f}% of flagged cells): {TE_DOMINANT_CLUSTERS}")
+else:
+    print(f"\n'{TE_DOMINANT_COL}' not in adata.obs -- fill MANUAL_TE_DOMINANT_CLUSTERS by hand.")
+    TE_DOMINANT_CLUSTERS = sorted(set(MANUAL_TE_DOMINANT_CLUSTERS))
+
+CLUSTER_7 = sorted(set(CLUSTER_7_EQUIVALENT))
+if not CLUSTER_7:
+    print("\nCLUSTER_7_EQUIVALENT is empty -- Sections 2-3's continuum check will be skipped. "
+          "Fill it in from clustering.py Section 6f's dotplot (non-significant top_padj, "
+          "decent cluster size).")
+
+focus_clusters = sorted(set(HIGH_MITO_CLUSTERS + CLUSTER_7 + TE_DOMINANT_CLUSTERS))
 
 # %% [markdown]
 # ## Helpers (same as clustering_checks.py — repeated here so this file runs standalone)
@@ -109,6 +181,9 @@ def palette_for(groups):
 
 
 def umap_highlight(adata, groups, label, title=None):
+    if not groups:
+        print(f"[{label}] empty group list -- skipping.")
+        return
     col = highlight_col(adata, groups, label)
     pal = palette_for(groups)
     sc.pl.umap(adata, color=col, palette=pal, size=8, title=title or f"UMAP — {label}", show=False)
@@ -117,6 +192,9 @@ def umap_highlight(adata, groups, label, title=None):
 
 
 def spatial_highlight(adata, groups, label, sample_col=SAMPLE_COL, title=None):
+    if not groups:
+        print(f"[{label}] empty group list -- skipping.")
+        return
     col = highlight_col(adata, groups, label)
     pal = palette_for(groups)
     samples = sorted(adata.obs[sample_col].unique())
@@ -148,7 +226,7 @@ def spatial_highlight(adata, groups, label, sample_col=SAMPLE_COL, title=None):
 
 def best_marker_table(adata_sub, groupby, n_genes=20):
     """rank_genes_groups, but report the best-padj gene within the top-N
-    by score, not just the top-1 — same logic we used for Scenario C."""
+    by score, not just the top-1."""
     sc.tl.rank_genes_groups(adata_sub, groupby=groupby, method="wilcoxon", n_genes=n_genes)
     rg = adata_sub.uns["rank_genes_groups"]
     rows = []
@@ -172,18 +250,21 @@ def best_marker_table(adata_sub, groupby, n_genes=20):
 # ## 1. High-mito clusters — marker genes. Fiber-oxidative or something else?
 
 # %%
-adata_mito = adata[adata.obs[CLUSTER_COL].isin(HIGH_MITO_CLUSTERS)].copy()
-mito_markers = best_marker_table(adata_mito, CLUSTER_COL, n_genes=20)
-print(mito_markers.to_string(index=False))
-mito_markers.to_csv(f"{OUTDIR}/high_mito_markers.csv", index=False)
+if HIGH_MITO_CLUSTERS:
+    adata_mito = adata[adata.obs[CLUSTER_COL].isin(HIGH_MITO_CLUSTERS)].copy()
+    mito_markers = best_marker_table(adata_mito, CLUSTER_COL, n_genes=20)
+    print(mito_markers.to_string(index=False))
+    mito_markers.to_csv(f"{OUTDIR}/high_mito_markers.csv", index=False)
+else:
+    print("HIGH_MITO_CLUSTERS is empty -- nothing to check.")
 
 # %% [markdown]
 # ## 2 & 3. New marker panels — mast cells + fiber types
 #
-# Mast cells were absent from the original 29-panel set. Fiber types let us
-# test two hypotheses at once: are the high-mito clusters oxidative
-# (type I) fibers, and does cluster 7 sit in the middle of the fiber-type
-# continuum (shares markers with neighbors, no exclusive one of its own)?
+# Mast cells absent from the original 29-panel set. Fiber types let us test
+# two hypotheses at once: are the high-mito clusters oxidative (type I)
+# fibers, and does CLUSTER_7 sit in the middle of the fiber-type continuum
+# (shares markers with neighbors, no exclusive one of its own)?
 
 # %%
 new_panels = {
@@ -208,11 +289,13 @@ new_score_cols = [f"score_{n}" for n in new_panels if f"score_{n}" in adata.obs.
 print(f"\nComputed: {new_score_cols}")
 
 # %%
-# Cluster-level view of the new panels, focused on high-mito + cluster 7 + core
-focus_clusters = HIGH_MITO_CLUSTERS + CLUSTER_7 + RESIDUAL_CLUSTERS + TE_DOMINANT_CLUSTERS
 score_by_cluster_new = adata.obs.groupby(CLUSTER_COL, observed=True)[new_score_cols].mean()
-print(score_by_cluster_new.loc[score_by_cluster_new.index.isin(focus_clusters)]
-      .sort_values("score_fiber_type_I", ascending=False))
+if focus_clusters:
+    print(score_by_cluster_new.loc[score_by_cluster_new.index.isin(focus_clusters)]
+          .sort_values("score_fiber_type_I", ascending=False))
+else:
+    print("focus_clusters is empty -- showing full table instead:")
+    print(score_by_cluster_new.sort_values("score_fiber_type_I", ascending=False))
 
 plt.figure(figsize=(6, 0.3 * len(score_by_cluster_new) + 2))
 sns.heatmap(score_by_cluster_new, cmap="RdBu_r", center=0, cbar_kws={"label": "mean score_genes"})
@@ -222,31 +305,40 @@ savefig("heatmap_new_panels_by_cluster")
 plt.show()
 
 # %%
-# Direct fiber-type check for cluster 7: does it sit between two fiber types
-# (shares both, dominated by neither) rather than having its own?
+# Direct fiber-type check: does CLUSTER_7_EQUIVALENT sit between two fiber
+# types (shares both, dominated by neither) rather than having its own?
 fiber_cols = [c for c in new_score_cols if c.startswith("score_fiber_type")]
-print("\nCluster 7 fiber-type profile (continuum check):")
-print(adata.obs.loc[adata.obs[CLUSTER_COL] == "7", fiber_cols].mean())
-print("\nFor comparison, its likely UMAP neighbors (adjust based on the UMAP if these aren't right):")
-for cl in ["0", "1", "3", "23"]:
-    if cl in adata.obs[CLUSTER_COL].unique():
-        print(f"  cluster {cl}:", adata.obs.loc[adata.obs[CLUSTER_COL] == cl, fiber_cols].mean().to_dict())
+if CLUSTER_7:
+    print(f"\n{CLUSTER_7} fiber-type profile (continuum check):")
+    print(adata.obs.loc[adata.obs[CLUSTER_COL].isin(CLUSTER_7), fiber_cols].mean())
+    if UMAP_NEIGHBOR_CANDIDATES:
+        print("\nFor comparison, its UMAP-neighboring clusters:")
+        for cl in UMAP_NEIGHBOR_CANDIDATES:
+            if cl in adata.obs[CLUSTER_COL].unique():
+                print(f"  cluster {cl}:", adata.obs.loc[adata.obs[CLUSTER_COL] == cl, fiber_cols].mean().to_dict())
+    else:
+        print("\nUMAP_NEIGHBOR_CANDIDATES is empty -- fill in a few clusters near "
+              f"{CLUSTER_7} on the UMAP to compare against.")
+else:
+    print("CLUSTER_7_EQUIVALENT is empty -- skipping the continuum check. Fill it in "
+          "from clustering.py Section 6f's dotplot first.")
 
 # %% [markdown]
-# ## 4. Fix: the real 96 TE-dominant cells (not 11,108)
+# ## 4. TE-dominant cells (Finding #10) — where do they land?
+# No hardcoded reference count anymore -- the reconstructed pipeline (Finding
+# #24) gives a different number each run depending on filter/resolution.
+# Just reports what's actually in the object.
 
 # %%
 if TE_DOMINANT_COL in adata.obs.columns:
     te_dominant = adata.obs[TE_DOMINANT_COL].astype(bool)
     n = te_dominant.sum()
     print(f"Using '{TE_DOMINANT_COL}': {n} TE-dominant cells")
-    if abs(n - 96) > 20:
-        print(f"  ⚠ still doesn't match the ~96 reference (Finding #10) — this column may not be "
-              f"the one, or the definition has changed since. Don't trust the plots below yet if so.")
-    else:
-        print("  ✓ matches the ~96 reference reasonably well.")
+    print(adata.obs.loc[te_dominant, SAMPLE_COL].value_counts())
+    print("\nBy cluster:")
+    print(adata.obs.loc[te_dominant, CLUSTER_COL].value_counts())
 else:
-    print(f"'{TE_DOMINANT_COL}' still not found in adata.obs — available columns:")
+    print(f"'{TE_DOMINANT_COL}' not found in adata.obs -- available columns with 'te'/'dom':")
     print([c for c in adata.obs.columns if "te" in c.lower() or "dom" in c.lower()])
     te_dominant = pd.Series(False, index=adata.obs_names)
 
@@ -308,9 +400,13 @@ adata.obs["TE_L1_fraction"] = raw_fraction(l1_features)
 adata.obs["TE_L2_fraction"] = raw_fraction(l2_features)
 
 print("\nMedian TE_L1_fraction / TE_L2_fraction by cluster (flagged clusters only):")
-print(adata.obs.groupby(CLUSTER_COL, observed=True)[["TE_L1_fraction", "TE_L2_fraction", TE_FRAC_COL]]
-      .median().loc[lambda d: d.index.isin(HIGH_MITO_CLUSTERS + RESIDUAL_CLUSTERS + TE_DOMINANT_CLUSTERS)]
-      .sort_values(TE_FRAC_COL, ascending=False))
+if focus_clusters:
+    print(adata.obs.groupby(CLUSTER_COL, observed=True)[["TE_L1_fraction", "TE_L2_fraction", TE_FRAC_COL]]
+          .median().loc[lambda d: d.index.isin(focus_clusters)]
+          .sort_values(TE_FRAC_COL, ascending=False))
+else:
+    print(adata.obs.groupby(CLUSTER_COL, observed=True)[["TE_L1_fraction", "TE_L2_fraction", TE_FRAC_COL]]
+          .median().sort_values(TE_FRAC_COL, ascending=False).head(10))
 
 # %%
 # Spatial + UMAP for L1 and L2 separately, continuous colorscale (not highlight-style,
@@ -344,16 +440,32 @@ for metric in ["TE_L1_fraction", "TE_L2_fraction"]:
 # ## 6. TE-only exploratory clustering (no genes, no Harmony)
 #
 # Tests whether TE expression alone reveals structure the gene-based
-# clustering doesn't capture (per the atlas-paper precedent discussed —
-# HERV-only HVFs found subclusters within known PBMC types). No batch
-# correction here on purpose: with 1 sample per condition, Harmony can't
-# tell technical batch effect from real condition-driven biology (same
-# reasoning as why TE is kept out of the main pipeline's Harmony step) —
-# so this is deliberately exploratory/uncorrected, read with that in mind.
+# clustering doesn't capture. No batch correction here on purpose: with 1
+# sample per condition, Harmony can't tell technical batch effect from real
+# condition-driven biology -- deliberately exploratory/uncorrected, read
+# with that in mind.
+#
+# **Bug fix applied here (Finding #23)**: `adata_te` inherits
+# `highly_variable=False` on every TE feature from the parent object (TEs
+# are never HVGs) -- `sc.pp.pca`'s default `use_highly_variable=True`
+# would filter the matrix to 0 columns and crash. Must pass
+# `use_highly_variable=False` explicitly. This was documented as the known
+# fix in PROJECT_CONTEXT.md but had never actually been applied in this
+# script until now.
 
 # %%
 adata_te = adata[:, adata.var[TE_VAR_FLAG_COL]].copy()
 print(f"TE-only object: {adata_te.n_obs} cells x {adata_te.n_vars} TE features")
+
+# Check for all-zero TE vectors before running -- a large fraction can
+# cause pathological behavior in the approximate-nearest-neighbor step
+# (per PROJECT_CONTEXT.md Finding #23's troubleshooting note).
+raw_te = adata_te.X
+frac_all_zero = np.asarray((raw_te.sum(axis=1) == 0)).ravel().mean() if sp.issparse(raw_te) else (raw_te.sum(axis=1) == 0).mean()
+print(f"Fraction of cells with an all-zero TE vector: {frac_all_zero:.3f}")
+if frac_all_zero > 0.5:
+    print("[WARNING] Over half the cells have zero TE signal -- neighbors/UMAP may behave "
+          "poorly or hang. Consider filtering to cells with at least 1 TE count first.")
 
 # Raw counts -> normalize/log for this exploratory embedding only
 adata_te.layers["counts"] = adata_te.X.copy()
@@ -361,7 +473,7 @@ sc.pp.normalize_total(adata_te, target_sum=1e4)
 sc.pp.log1p(adata_te)
 
 n_pcs_te = min(30, adata_te.n_vars - 1)
-sc.pp.pca(adata_te, n_comps=n_pcs_te)
+sc.pp.pca(adata_te, n_comps=n_pcs_te, use_highly_variable=False)  # Finding #23 fix
 sc.pp.neighbors(adata_te, n_neighbors=30, n_pcs=n_pcs_te)
 sc.tl.umap(adata_te)
 sc.tl.leiden(adata_te, resolution=0.5, objective_function="modularity", flavor="igraph")
@@ -394,4 +506,4 @@ print("\nReading this: if each gene-cluster row lights up in mostly ONE TE-only 
 # %% [markdown]
 # ## Done
 # New figures in `./clustering_checks_figs/`. `high_mito_markers.csv` saved
-# for pulling into the next round of slides.
+# (if HIGH_MITO_CLUSTERS was non-empty) for pulling into the next round of slides.
